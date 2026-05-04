@@ -24,7 +24,14 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from flask import Flask, abort, current_app, g, has_app_context, has_request_context, jsonify, redirect, render_template, request, send_file, session, url_for
 
-from config import AppConfig, HOSTED_APP_DISPLAY_NAME, HOSTED_APP_VERSION, get_app_config
+from config import (
+    AppConfig,
+    HOSTED_APP_DISPLAY_NAME,
+    HOSTED_APP_VERSION,
+    HOSTED_PRODUCTION_CALLBACK_URL,
+    HOSTED_PRODUCTION_PUBLIC_BASE_URL,
+    get_app_config,
+)
 from services import (
     ApolloService,
     ExportService,
@@ -614,6 +621,15 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
         configured_redirect_uri=configured_redirect_uri,
     )
     config_payload["schwab_redirect_uri"] = resolved_redirect_uri
+    strict_hosted_production = (
+        runtime_target == "hosted"
+        and not app.testing
+        and (
+            os.getenv("RENDER") == "true"
+            or bool(os.getenv("RENDER_SERVICE_ID"))
+            or str(os.getenv("DELPHI_DEPLOYMENT_ENV") or "").strip().lower() == "production"
+        )
+    )
     if runtime_target == "hosted" and configured_redirect_uri and configured_redirect_uri != resolved_redirect_uri:
         logging.getLogger(__name__).warning(
             "Hosted runtime forcing public Schwab redirect URI | configured_redirect_uri=%s | selected_redirect_uri=%s",
@@ -627,7 +643,15 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
             resolved_redirect_uri,
         )
     if runtime_target == "hosted":
+        normalized_hosted_public_base_url = hosted_public_base_url.rstrip("/")
+        if not normalized_hosted_public_base_url and strict_hosted_production:
+            normalized_hosted_public_base_url = HOSTED_PRODUCTION_PUBLIC_BASE_URL
+            config_payload["hosted_public_base_url"] = normalized_hosted_public_base_url
+        if strict_hosted_production and normalized_hosted_public_base_url != HOSTED_PRODUCTION_PUBLIC_BASE_URL:
+            raise RuntimeError("Hosted production requires HOSTED_PUBLIC_BASE_URL=https://eigeltrade.com.")
         config_payload["schwab_token_path"] = "supabase://hosted_runtime_state/schwab_oauth_token/default"
+        if strict_hosted_production and str(config_payload.get("schwab_redirect_uri") or "").strip() != HOSTED_PRODUCTION_CALLBACK_URL:
+            raise RuntimeError("Hosted production requires SCHWAB redirect_uri=https://eigeltrade.com/callback.")
 
     return AppConfig(**config_payload)
 
