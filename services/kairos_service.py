@@ -668,7 +668,8 @@ class KairosService:
         replay_storage_dir: str | Path | None = None,
         scenario_repository: KairosBundleRepository | None = None,
         trade_store: TradeRepository | None = None,
-        scan_interval_seconds: int = LIVE_SCAN_INTERVAL_SECONDS,
+        scan_interval_seconds: int | None = None,
+        strategy_parameters: Dict[str, Any] | None = None,
         timer_factory: Callable[..., Timer] | None = None,
         scheduler: RuntimeScheduler | None = None,
         now_provider: Callable[[], datetime] | None = None,
@@ -686,7 +687,23 @@ class KairosService:
         self.notification_delivery = (
             PushoverNotificationDelivery(pushover_service) if isinstance(pushover_service, PushoverService) else pushover_service
         )
-        self.live_scan_interval_seconds = scan_interval_seconds
+        parameters = strategy_parameters or {}
+        self.TIMING_LOCK_RELEASE = self._resolve_strategy_time(parameters.get("timing_lock_release"), self.TIMING_LOCK_RELEASE)
+        self.TIMING_LATE_START = self._resolve_strategy_time(parameters.get("timing_late_start"), self.TIMING_LATE_START)
+        self.TIMING_END = self._resolve_strategy_time(parameters.get("timing_end"), self.TIMING_END)
+        self.LIVE_SCAN_INTERVAL_SECONDS = int(parameters.get("live_scan_interval_seconds") or self.LIVE_SCAN_INTERVAL_SECONDS)
+        self.KAIROS_CANDIDATE_ACCOUNT_RISK_PERCENT = float(parameters.get("candidate_account_risk_percent") or self.KAIROS_CANDIDATE_ACCOUNT_RISK_PERCENT)
+        self.KAIROS_CANDIDATE_MIN_CREDIT_DOLLARS = float(parameters.get("candidate_min_credit_dollars") or self.KAIROS_CANDIDATE_MIN_CREDIT_DOLLARS)
+        self.KAIROS_CANDIDATE_SPREAD_WIDTH_POINTS = int(parameters.get("candidate_spread_width_points") or self.KAIROS_CANDIDATE_SPREAD_WIDTH_POINTS)
+        self.LIVE_KAIROS_SPREAD_WIDTH_SCAN_POINTS = tuple(int(item) for item in (parameters.get("live_spread_width_scan_points") or self.LIVE_KAIROS_SPREAD_WIDTH_SCAN_POINTS))
+        self.KAIROS_CANDIDATE_MIN_DISTANCE_PERCENT = float(parameters.get("candidate_min_distance_percent") or self.KAIROS_CANDIDATE_MIN_DISTANCE_PERCENT)
+        self.KAIROS_HYBRID_EXPECTED_MOVE_MULTIPLE = float(parameters.get("hybrid_expected_move_multiple") or self.KAIROS_HYBRID_EXPECTED_MOVE_MULTIPLE)
+        self.KAIROS_CANDIDATE_MAX_SHORT_DELTA = float(parameters.get("candidate_max_short_delta") or self.KAIROS_CANDIDATE_MAX_SHORT_DELTA)
+        self.KAIROS_CANDIDATE_MIN_CONTRACTS = int(parameters.get("candidate_min_contracts") or self.KAIROS_CANDIDATE_MIN_CONTRACTS)
+        self.KAIROS_CANDIDATE_MAX_CONTRACTS = int(parameters.get("candidate_max_contracts") or self.KAIROS_CANDIDATE_MAX_CONTRACTS)
+        self.KAIROS_CANDIDATE_PROFILES = tuple(dict(item) for item in (parameters.get("candidate_profiles") or self.KAIROS_CANDIDATE_PROFILES))
+        self.KAIROS_EXIT_GATES = tuple(dict(item) for item in (parameters.get("exit_gates") or self.KAIROS_EXIT_GATES))
+        self.live_scan_interval_seconds = int(scan_interval_seconds) if scan_interval_seconds is not None else self.LIVE_SCAN_INTERVAL_SECONDS
         self.timer_factory = timer_factory or Timer
         self.scheduler = scheduler
         self.now_provider = now_provider or (lambda: datetime.now(self.display_timezone))
@@ -702,6 +719,7 @@ class KairosService:
         self._historical_replay_catalog: Dict[str, Dict[str, Any]] = {}
         self._persisted_scenarios_dirty = False
         self._persisted_scenarios_last_synced_at: float | None = None
+        self._scenario_repository_write_count_at_last_sync: int = 0
         self._cached_runner_candidate_context_key: tuple[Any, ...] | None = None
         self._cached_runner_candidate_context: Dict[str, Any] | None = None
         self._live_best_trade_override_requested = False
@@ -715,6 +733,21 @@ class KairosService:
         )
         self.trade_store = trade_store
         self._load_persisted_kairos_scenarios()
+
+    @staticmethod
+    def _resolve_strategy_time(value: Any, fallback: time) -> time:
+        raw = str(value or "").strip()
+        if not raw:
+            return fallback
+        for fmt in ("%H:%M", "%H:%M:%S"):
+            try:
+                return datetime.strptime(raw, fmt).time()
+            except ValueError:
+                continue
+        try:
+            return time.fromisoformat(raw)
+        except ValueError:
+            return fallback
 
     def _build_real_trade_outcome_profile(self) -> Dict[str, Any]:
         if self.trade_store is None:
@@ -758,11 +791,14 @@ class KairosService:
             self._register_persisted_replay_scenario(scenario, template)
         self._persisted_scenarios_dirty = False
         self._persisted_scenarios_last_synced_at = monotonic()
+        self._scenario_repository_write_count_at_last_sync = getattr(self._scenario_repository, "write_count", 0)
 
     def _sync_persisted_scenarios_locked(self, *, force: bool = False) -> None:
         if not force and not self._persisted_scenarios_dirty and self._persisted_scenarios_last_synced_at is not None:
-            if (monotonic() - self._persisted_scenarios_last_synced_at) < self.PERSISTED_SCENARIO_SYNC_INTERVAL_SECONDS:
-                return
+            repo_write_count = getattr(self._scenario_repository, "write_count", 0)
+            if repo_write_count == self._scenario_repository_write_count_at_last_sync:
+                if (monotonic() - self._persisted_scenarios_last_synced_at) < self.PERSISTED_SCENARIO_SYNC_INTERVAL_SECONDS:
+                    return
         self._load_persisted_kairos_scenarios()
 
     def _mark_persisted_scenarios_dirty_locked(self) -> None:
@@ -2036,6 +2072,26 @@ class KairosService:
             self._session.next_scan_at = None
             self._session.current_state = KairosState.STOPPED.value
             self._session.status_note = "Kairos full-day runner ended manually."
+            return self._build_payload_locked(now)
+
+    def import_historical_replay_template(self, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Import a historical replay scenario from Schwab or JSON and return the updated dashboard payload."""
+        payload = payload or {}
+        now = self._now()
+        session_date = self._coerce_historical_replay_date(payload.get("session_date"))
+        requested_source = self._coerce_historical_replay_source(payload.get("source") or "auto")
+        raw_json = str(payload.get("json_payload") or payload.get("raw_json") or "").strip()
+        with self._lock:
+            self._refresh_session_locked(now)
+            scenario, template = self._resolve_historical_replay_import(
+                session_date=session_date,
+                requested_source=requested_source,
+                raw_json=raw_json,
+            )
+            self._persist_historical_replay_locked(scenario, template)
+            self._register_persisted_replay_scenario(scenario, template)
+            self._mark_persisted_scenarios_dirty_locked()
+            self._session.status_note = f"Historical replay ready: {template.scenario_name} ({template.source_label})."
             return self._build_payload_locked(now)
 
     def get_dashboard_payload(self) -> Dict[str, Any]:

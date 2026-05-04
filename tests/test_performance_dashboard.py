@@ -129,7 +129,7 @@ class PerformanceDashboardTest(unittest.TestCase):
             close_reason="",
         )
         self._create_trade(
-            "talos",
+            "simulated",
             system_name="Kairos",
             candidate_profile="Prime",
             trade_date="2026-04-04",
@@ -210,7 +210,8 @@ class PerformanceDashboardTest(unittest.TestCase):
         self.assertIn(b"data-performance-url=\"/performance/data\"", response.data)
         self.assertIn(b"System", response.data)
         self.assertIn(b"Trade Mode", response.data)
-        self.assertIn(b"Talos", response.data)
+        self.assertIn(b"Simulated", response.data)
+        self.assertNotIn(b"Talos", response.data)
         self.assertIn(b"performance-line-popup", response.data)
         self.assertIn(b"Performance Learning Metrics", response.data)
         self.assertIn(b"id=\"credit-efficiency-system-panel\"", response.data)
@@ -218,9 +219,6 @@ class PerformanceDashboardTest(unittest.TestCase):
         self.assertIn(b"id=\"credit-efficiency-vix-panel\"", response.data)
         self.assertIn(b"EM Performance by Profile", response.data)
         self.assertIn(b"id=\"profile-em-performance-panel\"", response.data)
-        self.assertIn(b"Custom Range", response.data)
-        self.assertIn(b'id="performance-start-date"', response.data)
-        self.assertIn(b'id="performance-end-date"', response.data)
         self.assertIn(b"Distance Efficiency Score", response.data)
         self.assertIn(b"id=\"distance-efficiency-panel\"", response.data)
         self.assertIn(b"Time of Entry Edge", response.data)
@@ -234,20 +232,89 @@ class PerformanceDashboardTest(unittest.TestCase):
         self.assertIn(b"Safety Ratio Curve Summary", response.data)
         self.assertIn(b"id=\"safety-ratio-expectancy-chart\"", response.data)
         self.assertIn(b"id=\"safety-ratio-bucket-summary\"", response.data)
+        self.assertIn(b"id=\"safety-ratio-summary-details\"", response.data)
+        self.assertIn(b"Learning Audit", response.data)
+        self.assertIn(b"id=\"learning-audit-details\"", response.data)
+        self.assertIn(b"id=\"learning-audit-panel\"", response.data)
+        self.assertNotIn(b"Live vs Simulated", response.data)
+        self.assertNotIn(b"Adaptive Safety Guidance", response.data)
+        self.assertNotIn(b"EM Policy Guidance", response.data)
+        self.assertNotIn(b"Best EM Range by VIX", response.data)
+        self.assertNotIn(b"Fallback Impact", response.data)
+        self.assertNotIn(b"Learning Status", response.data)
+        self.assertNotIn(b"Result Classification Audit", response.data)
+        self.assertNotIn(b"id=\"trade-mode-learning-grid\"", response.data)
+        self.assertNotIn(b"id=\"adaptive-safety-guidance\"", response.data)
+        self.assertNotIn(b"id=\"em-policy-guidance\"", response.data)
+        self.assertNotIn(b"id=\"em-policy-vix-guidance\"", response.data)
+        self.assertNotIn(b"id=\"em-policy-fallback-impact\"", response.data)
+        self.assertNotIn(b"id=\"em-policy-learning-status\"", response.data)
+        self.assertNotIn(b"id=\"result-classification-audit\"", response.data)
+        self.assertNotIn(b"id=\"safety-ratio-summary-details\" open", response.data)
+        self.assertNotIn(b"id=\"learning-audit-details\" open", response.data)
+        self.assertIn(b"Premium collected divided by maximum theoretical risk at entry.", response.data)
+        self.assertNotIn(b"performance-line-tooltip", response.data)
+        self.assertNotIn(b"mouseenter", response.data)
+        self.assertNotIn(b"mouseleave", response.data)
+        self.assertIn(b'data-filter-group="trade_mode" value="real" checked', response.data)
+        self.assertIn(b'data-filter-group="trade_mode" value="simulated"', response.data)
+        self.assertIn(b'value="custom"', response.data)
+        self.assertIn(b'id="performance-expiration-start"', response.data)
+        self.assertIn(b'id="performance-expiration-end"', response.data)
+        self.assertIn(b'id="performance-custom-apply"', response.data)
 
-    def test_performance_data_route_filters_by_custom_expiration_date_range(self):
-        response = self.client.get(
-            "/performance/data?trade_mode__active=1&trade_mode=real&timeframe__active=1&timeframe=custom-range&start_date=2026-04-02&end_date=2026-04-03"
+    def test_custom_timeframe_filters_by_expiration_date_range(self):
+        payload = build_dashboard_payload(
+            [
+                build_performance_record(
+                    {
+                        "id": 201,
+                        "trade_number": 201,
+                        "trade_mode": "real",
+                        "system_name": "Apollo",
+                        "candidate_profile": "Standard",
+                        "status": "closed",
+                        "trade_date": "2026-04-20",
+                        "expiration_date": "2026-04-21",
+                        "gross_pnl": 120.0,
+                        "actual_entry_credit": 1.5,
+                        "spread_width": 5.0,
+                        "contracts": 1,
+                    }
+                ),
+                build_performance_record(
+                    {
+                        "id": 202,
+                        "trade_number": 202,
+                        "trade_mode": "real",
+                        "system_name": "Apollo",
+                        "candidate_profile": "Standard",
+                        "status": "closed",
+                        "trade_date": "2026-04-27",
+                        "expiration_date": "2026-04-28",
+                        "gross_pnl": 80.0,
+                        "actual_entry_credit": 1.25,
+                        "spread_width": 5.0,
+                        "contracts": 1,
+                    }
+                ),
+            ],
+            filters={
+                "system": ["apollo", "kairos", "aegis"],
+                "profile": ["legacy", "aggressive", "fortress", "standard", "prime", "subprime"],
+                "result": ["win", "loss", "black-swan", "scratched"],
+                "trade_mode": ["real"],
+                "macro_grade": ["none", "minor", "major"],
+                "structure_grade": ["good", "neutral", "poor"],
+                "timeframe": ["custom"],
+                "expiration_start": ["2026-04-22"],
+                "expiration_end": ["2026-04-29"],
+            },
         )
 
-        payload = response.get_json()
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(payload["records_total"], 5)
+        self.assertEqual(payload["records_total"], 2)
         self.assertEqual(payload["records_filtered"], 1)
-        self.assertEqual(payload["filters"]["start_date"], "2026-04-02")
-        self.assertEqual(payload["filters"]["end_date"], "2026-04-03")
-        self.assertEqual(payload["charts"]["equity_curve"]["points"][0]["label"], "2026-04-02")
+        self.assertEqual(payload["charts"]["equity_curve"]["points"][0]["label"], "2026-04-28")
 
     def test_performance_data_route_returns_expected_metrics_and_filters(self):
         response = self.client.get("/performance/data")
@@ -662,23 +729,23 @@ class PerformanceDashboardTest(unittest.TestCase):
                 "trade_mode": ["real", "simulated"],
                 "result": ["win", "loss", "black-swan"],
                 "system": ["apollo", "kairos"],
-                "profile": ["legacy", "aggressive", "fortress", "standard"],
+                "profile": ["legacy", "aggressive", "fortress", "standard", "prime"],
                 "macro_grade": ["none", "minor", "major"],
                 "structure_grade": ["good", "neutral", "poor"],
             },
         )
 
         self.assertEqual(len(outcomes.open_records), 1)
-        self.assertEqual(len(outcomes.closed_records), 3)
-        self.assertEqual(len(outcomes.wins), 1)
+        self.assertEqual(len(outcomes.closed_records), 4)
+        self.assertEqual(len(outcomes.wins), 2)
         self.assertEqual(len(outcomes.losses), 1)
         self.assertEqual(len(outcomes.black_swans), 1)
         self.assertEqual(len(outcomes.loss_events), 2)
-        self.assertEqual(len(outcomes.closed_outcomes), 3)
-        self.assertEqual(metrics["win_rate"]["wins"], 1)
+        self.assertEqual(len(outcomes.closed_outcomes), 4)
+        self.assertEqual(metrics["win_rate"]["wins"], 2)
         self.assertEqual(metrics["win_rate"]["losses"], 2)
-        self.assertEqual(metrics["win_rate"]["closed_outcomes"], 3)
-        self.assertAlmostEqual(metrics["expectancy"]["value"], -100.0)
+        self.assertEqual(metrics["win_rate"]["closed_outcomes"], 4)
+        self.assertAlmostEqual(metrics["expectancy"]["value"], -45.0)
 
         outcome_mix = {item["label"]: item["value"] for item in payload["charts"]["outcome_composition"]["items"]}
         self.assertEqual(outcome_mix["Win"], metrics["win_rate"]["wins"])

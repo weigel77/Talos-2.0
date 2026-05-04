@@ -984,7 +984,7 @@ class OpenTradeManager:
 
     def _load_open_trades(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        for trade_mode in ("real", "simulated", "talos"):
+        for trade_mode in ("real", "simulated"):
             rows.extend(
                 trade
                 for trade in self.trade_store.list_trades(trade_mode)

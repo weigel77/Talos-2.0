@@ -282,10 +282,10 @@ class OpenTradeManagerTest(unittest.TestCase):
     def test_simulated_trades_still_appear_in_management_list(self):
         payload = self.manager.evaluate_open_trades(send_alerts=False)
 
-        self.assertEqual(payload["open_trade_count"], 4)
+        self.assertEqual(payload["open_trade_count"], 3)
         trade_modes = {item["trade_number"]: item["trade_mode"] for item in payload["records"]}
         self.assertIn("Simulated", trade_modes.values())
-        self.assertIn("Talos", trade_modes.values())
+        self.assertNotIn("Talos", trade_modes.values())
 
     def test_plain_board_uses_minimal_kairos_management_context(self):
         def fail_dashboard_call():
@@ -477,7 +477,7 @@ class OpenTradeManagerTest(unittest.TestCase):
 
         second_payload = self.manager.evaluate_open_trades(send_alerts=True)
 
-        self.assertEqual(first_payload["open_trade_count"], 4)
+        self.assertEqual(first_payload["open_trade_count"], 3)
         self.assertEqual(second_payload["alerts_sent"], 0)
         self.assertEqual(len(self.pushover_service.sent), 0)
 

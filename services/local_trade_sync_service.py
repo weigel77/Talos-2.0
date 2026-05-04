@@ -9,7 +9,7 @@ from services.repositories.trade_repository import TradeRepository
 from services.trade_store import EDITABLE_FIELDS
 
 
-SYNCABLE_TRADE_MODES: tuple[str, ...] = ("real", "simulated", "talos")
+SYNCABLE_TRADE_MODES: tuple[str, ...] = ("real", "simulated")
 
 
 @dataclass(frozen=True)

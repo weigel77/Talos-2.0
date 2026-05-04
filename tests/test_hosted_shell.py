@@ -307,20 +307,15 @@ class HostedShellTest(unittest.TestCase):
             self.assertEqual(response.status_code, 302)
             self.assertIn("/hosted/launch?next=/hosted/performance", response.headers["Location"])
 
-    def test_hosted_shell_home_renders_for_allowed_bill_identity(self):
+    def test_hosted_shell_home_redirects_to_manage_trades_for_allowed_bill_identity(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app = self._create_hosted_app(temp_dir)
             self._allow_identity(app)
 
-            response = app.test_client().get("/hosted")
+            response = app.test_client().get("/hosted", follow_redirects=False)
 
-            self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Delphi 6.4.1", response.data)
-        self.assertIn(b"/hosted/research", response.data)
-        self.assertIn(b"/hosted/performance", response.data)
-        self.assertIn(b"/hosted/journal?trade_mode=real", response.data)
-        self.assertIn(b"/hosted/manage-trades", response.data)
-        self.assertNotIn(b"Text Status", response.data)
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response.headers["Location"], "/hosted/manage-trades")
 
     def test_hosted_runtime_redirects_canonical_local_pages_to_hosted_shell_routes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -858,7 +853,7 @@ class HostedShellTest(unittest.TestCase):
             response = app.test_client().get("/hosted/journal?trade_mode=simulated")
 
             self.assertEqual(response.status_code, 200)
-            self.assertIn(b'Hosted Delphi 6.4.1 journal mirrors the live Supabase trade store and supports draft review, editing, and deleting directly in hosted mode.', response.data)
+            self.assertIn(b'Hosted Delphi 8.0.7 journal mirrors the live Supabase trade store and supports draft review, editing, and deleting directly in hosted mode.', response.data)
             self.assertIn(b'/hosted/journal?trade_mode=real', response.data)
             self.assertIn(b'/hosted/journal?trade_mode=simulated', response.data)
             self.assertIn(b'/hosted/journal/simulated/7/edit', response.data)
@@ -868,54 +863,6 @@ class HostedShellTest(unittest.TestCase):
             self.assertIn(b'$95', response.data)
             self.assertNotIn(b'Max Loss', response.data)
             self.assertNotIn(b'Jump to Manual Entry Form', response.data)
-
-    def test_hosted_journal_allows_talos_mode_when_supabase_contains_talos_rows(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            app = self._create_hosted_app(temp_dir)
-            self._allow_identity(app)
-            app.extensions["trade_store"] = _FakeTradeStore(
-                {
-                    "talos": [
-                        {
-                            "id": 11,
-                            "trade_number": 75,
-                            "trade_mode": "talos",
-                            "system_name": "Apollo",
-                            "candidate_profile": "Standard",
-                            "status": "open",
-                            "trade_date": "2026-04-20",
-                            "entry_datetime": "2026-04-20T09:45",
-                            "expiration_date": "2026-04-20",
-                            "underlying_symbol": "SPX",
-                            "short_strike": 7080,
-                            "long_strike": 7070,
-                            "contracts": 2,
-                            "actual_entry_credit": 1.35,
-                            "gross_pnl": 0.0,
-                            "win_loss_result": "Open",
-                            "journal_name": "Horme",
-                        }
-                    ]
-                },
-                {
-                    "talos": {
-                        "total_trades": 1,
-                        "open_trades": 1,
-                        "closed_trades": 0,
-                        "total_pnl": 0.0,
-                        "average_pnl": 0.0,
-                        "win_count": 0,
-                        "loss_count": 0,
-                    }
-                },
-            )
-
-            response = app.test_client().get("/hosted/journal?trade_mode=talos")
-
-            self.assertEqual(response.status_code, 200)
-            self.assertIn(b'/hosted/journal?trade_mode=talos', response.data)
-            self.assertIn(b'Talos', response.data)
-            self.assertIn(b'75', response.data)
 
     def test_hosted_apollo_prefill_redirects_into_hosted_journal_draft(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1287,7 +1234,7 @@ class HostedShellTest(unittest.TestCase):
             response = app.test_client().get("/hosted/manage-trades")
 
             self.assertEqual(response.status_code, 200)
-            self.assertIn(b'Hosted Delphi 6.4.1 pulls the same live open-trade evaluation data', response.data)
+            self.assertIn(b'Hosted Delphi 8.0.7 pulls the same live open-trade evaluation data', response.data)
             self.assertIn(b'Watch', response.data)
             self.assertIn(b'Hold', response.data)
             self.assertIn(b'Send Real Status Update', response.data)
@@ -1350,7 +1297,7 @@ class HostedShellTest(unittest.TestCase):
             response = app.test_client().get("/hosted/performance")
 
             self.assertEqual(response.status_code, 503)
-            self.assertIn(b'Delphi 6.4.1 cannot load performance', response.data)
+            self.assertIn(b'Delphi 8.0.7 cannot load performance', response.data)
             self.assertIn(b'journal_trades', response.data)
 
     def test_hosted_journal_page_returns_admin_visible_error_when_supabase_trade_table_is_missing(self):
@@ -1362,7 +1309,7 @@ class HostedShellTest(unittest.TestCase):
             response = app.test_client().get("/hosted/journal?trade_mode=real")
 
             self.assertEqual(response.status_code, 503)
-            self.assertIn(b'Delphi 6.4.1 cannot load journal', response.data)
+            self.assertIn(b'Delphi 8.0.7 cannot load journal', response.data)
             self.assertIn(b'journal_trade_close_events', response.data)
 
     def test_hosted_manage_trades_page_returns_admin_visible_error_when_supabase_trade_table_is_missing(self):
@@ -1377,7 +1324,7 @@ class HostedShellTest(unittest.TestCase):
 
             self.assertEqual(response.status_code, 503)
             self.assertEqual(manager.calls, [])
-            self.assertIn(b'Delphi 6.4.1 cannot load manage-trades', response.data)
+            self.assertIn(b'Delphi 8.0.7 cannot load manage-trades', response.data)
             self.assertIn(b'active_trades', response.data)
 
     def test_hosted_apollo_page_renders_last_snapshot(self):

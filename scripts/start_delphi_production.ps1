@@ -14,6 +14,7 @@ if (-not (Test-Path $pythonExe)) {
 
 Push-Location $repoRoot
 try {
+    $env:DELPHI_DEPLOYMENT_ENV = 'production'
     $env:DELPHI_RUNTIME_TARGET = 'hosted'
     if (-not $env:APP_HOST) {
         $env:APP_HOST = '0.0.0.0'
@@ -22,7 +23,7 @@ try {
         $env:APP_PORT = '10000'
     }
     $env:HOSTED_PUBLIC_BASE_URL = 'https://eigeltrade.com'
-    $env:SCHWAB_REDIRECT_URI = ''
+    $env:SCHWAB_REDIRECT_URI = 'https://eigeltrade.com/callback'
     $env:APP_DISPLAY_NAME = 'Delphi 8.0.7'
     $env:APP_PAGE_KICKER = 'Delphi 8.0.7'
     $env:APP_VERSION_LABEL = 'Version 8.0.7'

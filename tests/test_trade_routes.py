@@ -1354,7 +1354,7 @@ class TradeRoutesTest(unittest.TestCase):
         response = self.client.post("/apollo")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Version 7.2.15", response.data)
+        self.assertIn(b"Version 8.0.7", response.data)
         self.assertIn(b"Apollo: Greek God of Prophecy and Part-Time Options Trader", response.data)
         self.assertIn(b"Base Structure", response.data)
         self.assertIn(b"RSI Modifier", response.data)
@@ -1665,3 +1665,4 @@ class TradeRoutesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

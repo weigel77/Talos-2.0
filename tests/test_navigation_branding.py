@@ -90,7 +90,6 @@ class DelphiNavigationBrandingTest(unittest.TestCase):
         self.assertIn(b"Research", response.data)
         self.assertIn(b"Run Apollo", response.data)
         self.assertIn(b"Run Kairos", response.data)
-        self.assertIn(b"Talos", response.data)
         self.assertIn(b"Performance", response.data)
         self.assertIn(b"Journal", response.data)
         self.assertIn(b"Schwab connection", response.data)
@@ -195,12 +194,10 @@ class DelphiNavigationBrandingTest(unittest.TestCase):
                 "/",
                 "/research",
                 "/apollo?autorun=1",
-                "/talos",
                 "/management/open-trades",
                 "/performance",
                 "/trades/real",
                 "/trades/simulated",
-                "/trades/talos",
                 "/kairos/live",
             ]
 
@@ -231,14 +228,14 @@ class DelphiNavigationBrandingTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["message"], "Pushover test alert sent.")
-        self.assertEqual(payload["title"], "Delphi 7.2.15 Local Test Alert")
+        self.assertEqual(payload["title"], "Delphi 8.0.7 Local Test Alert")
         self.assertEqual(len(pushover_calls), 1)
         self.assertEqual(pushover_calls[0]["api_url"], "https://api.pushover.net/1/messages.json")
-        self.assertEqual(pushover_calls[0]["payload"]["title"], "Delphi 7.2.15 Local Test Alert")
+        self.assertEqual(pushover_calls[0]["payload"]["title"], "Delphi 8.0.7 Local Test Alert")
         self.assertIn("SPX Update", pushover_calls[0]["payload"]["message"])
         self.assertIn("SPX: 6,123.45", pushover_calls[0]["payload"]["message"])
         self.assertIn("VIX: 18.76", pushover_calls[0]["payload"]["message"])
-        self.assertIn("Source: Delphi 7.2.15 Local Pushover test", pushover_calls[0]["payload"]["message"])
+        self.assertIn("Source: Delphi 8.0.7 Local Pushover test", pushover_calls[0]["payload"]["message"])
 
     def test_manual_text_status_endpoint_surfaces_missing_pushover_credentials(self):
         pushover_service = self.app.extensions["pushover_service"]
@@ -438,7 +435,6 @@ class DelphiNavigationBrandingTest(unittest.TestCase):
             ],
             b'/static/icons/apollo-icon.png': [self.client.get("/apollo?autorun=1")],
             b'/static/icons/kairos-icon.png': [self.client.get("/kairos/live")],
-            b'/static/icons/talos-icon.png': [self.client.get("/talos")],
             b'/static/icons/journal-icon.png': [self.client.get("/trades/real")],
             b'/static/icons/performance-icon.png': [self.client.get("/performance")],
         }
@@ -458,7 +454,7 @@ class DelphiNavigationBrandingTest(unittest.TestCase):
         self.assertIn(b"Send Simulated Status Update", response.data)
         self.assertIn(b"Notifications: ON", response.data)
         self.assertIn(b"manual status updates stay limited to real and simulated positions", response.data)
-        self.assertIn(b"No open real, simulated, or Talos trades are currently available for management.", response.data)
+        self.assertIn(b"No open real or simulated trades are currently available for management.", response.data)
         self.assertIn(b'data-delphi-nav="management" aria-current="page"', response.data)
 
     def test_performance_page_uses_shared_header_and_active_nav_state(self):
@@ -501,3 +497,4 @@ class DelphiNavigationBrandingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -11,14 +11,11 @@ import secrets
 import time
 import os
 import urllib.parse
-from collections import Counter
-from contextlib import contextmanager
-from functools import wraps
 from pathlib import Path
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -120,10 +117,9 @@ HOSTED_SESSION_USER_ID_KEY = "hosted_user_id"
 HOSTED_SESSION_EMAIL_KEY = "hosted_user_email"
 HOSTED_SESSION_DISPLAY_NAME_KEY = "hosted_user_display_name"
 HOSTED_SESSION_DEVICE_BRANCH_KEY = "hosted_device_branch"
+HOSTED_FORCE_REAUTH_SESSION_KEY = "hosted_force_reauth"
 HOSTED_LOCAL_BROWSER_SESSION_COOKIE = "delphi_hosted_local_session"
-HOSTED_SCHWAB_POST_AUTH_REDIRECT_KEY = "hosted_schwab_post_auth_redirect"
 HOSTED_PAYLOAD_CACHE_EXTENSION_KEY = "hosted_payload_cache"
-HOSTED_DELPHI4_SYNC_RESULT_KEY = "hosted_delphi4_sync_result"
 HOSTED_MOBILE_APOLLO_HANDOFF_KEY = "hosted_mobile_apollo_handoff"
 HOSTED_MOBILE_KAIROS_HANDOFF_KEY = "hosted_mobile_kairos_handoff"
 HOSTED_PERFORMANCE_CACHE_SECONDS = 8
@@ -138,239 +134,6 @@ HOSTED_SURFACE_REQUIRED_TABLES = {
 }
 HOSTED_LOCAL_DEBUG_EMAIL = "copilot-hosted-debug@example.com"
 LOCALHOST_DEV_CERT_BASENAME = "localhost+2"
-REQUEST_PROFILE_KEY = "_delphi_request_profile"
-STARTUP_MENU_CACHE_EXTENSION_KEY = "startup_menu_payload_cache"
-STARTUP_MENU_CACHE_SECONDS = 10
-
-
-class _RepeatedInfoFilter(logging.Filter):
-    def __init__(self, *, suppress_after: int = 1, window_seconds: float = 20.0) -> None:
-        super().__init__()
-        self.suppress_after = suppress_after
-        self.window_seconds = window_seconds
-        self._history: Dict[str, tuple[float, int]] = {}
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno > logging.INFO:
-            return True
-        message = record.getMessage()
-        now = time.monotonic()
-        prior = self._history.get(message)
-        if prior is None or (now - prior[0]) > self.window_seconds:
-            self._history[message] = (now, 1)
-            return True
-        repeated_count = prior[1] + 1
-        self._history[message] = (prior[0], repeated_count)
-        return repeated_count <= self.suppress_after
-
-
-def _should_profile_local_request(app: Optional[Flask] = None) -> bool:
-    container = _resolve_flask_container(app) if app is not None else current_app
-    return bool(has_request_context() and container.config.get("RUNTIME_TARGET") != "hosted")
-
-
-def _ensure_request_profile() -> Optional[Dict[str, Any]]:
-    if not has_request_context() or not _should_profile_local_request():
-        return None
-    profile = getattr(g, REQUEST_PROFILE_KEY, None)
-    if profile is None:
-        profile = {
-            "started_at": time.perf_counter(),
-            "market": {},
-            "trade": {},
-            "builder": {},
-            "template": {},
-            "duplicates": Counter(),
-            "cache": Counter(),
-        }
-        setattr(g, REQUEST_PROFILE_KEY, profile)
-    return profile
-
-
-def _record_request_timing(bucket: str, label: str, elapsed_ms: float, *, cache_state: Optional[str] = None) -> None:
-    profile = _ensure_request_profile()
-    if profile is None:
-        return
-    bucket_payload = profile[bucket]
-    entry = bucket_payload.setdefault(label, {"count": 0, "elapsed_ms": 0.0, "max_ms": 0.0})
-    entry["count"] += 1
-    entry["elapsed_ms"] += elapsed_ms
-    entry["max_ms"] = max(float(entry["max_ms"]), elapsed_ms)
-    if entry["count"] > 1:
-        profile["duplicates"][f"{bucket}:{label}"] = entry["count"]
-    if cache_state:
-        profile["cache"][cache_state] += 1
-
-
-def _sum_bucket_elapsed(profile: Dict[str, Any], bucket: str) -> float:
-    return round(sum(float(item.get("elapsed_ms") or 0.0) for item in profile.get(bucket, {}).values()), 1)
-
-
-def _summarize_bucket(profile: Dict[str, Any], bucket: str, *, limit: int = 5) -> str:
-    items = sorted(
-        profile.get(bucket, {}).items(),
-        key=lambda item: (-float(item[1].get("elapsed_ms") or 0.0), item[0]),
-    )
-    if not items:
-        return "none"
-    summary_parts = []
-    for label, payload in items[:limit]:
-        summary_parts.append(f"{label} x{int(payload.get('count') or 0)} {float(payload.get('elapsed_ms') or 0.0):.1f}ms")
-    return "; ".join(summary_parts)
-
-
-def _log_request_profile(response: Any) -> Any:
-    if not has_request_context() or request.path.startswith("/static/"):
-        return response
-    profile = getattr(g, REQUEST_PROFILE_KEY, None)
-    if profile is None:
-        return response
-    total_ms = (time.perf_counter() - float(profile.get("started_at") or time.perf_counter())) * 1000.0
-    current_app.logger.info(
-        "Local request trace | route=%s | endpoint=%s | method=%s | status=%s | total_ms=%.1f | market_calls=%s | market_ms=%.1f | trade_calls=%s | trade_ms=%.1f | builder_ms=%.1f | template_ms=%.1f | cache=%s | builders=%s | templates=%s | duplicates=%s",
-        request.path,
-        request.endpoint,
-        request.method,
-        getattr(response, "status_code", "n/a"),
-        total_ms,
-        sum(int(item.get("count") or 0) for item in profile.get("market", {}).values()),
-        _sum_bucket_elapsed(profile, "market"),
-        sum(int(item.get("count") or 0) for item in profile.get("trade", {}).values()),
-        _sum_bucket_elapsed(profile, "trade"),
-        _sum_bucket_elapsed(profile, "builder"),
-        _sum_bucket_elapsed(profile, "template"),
-        dict(profile.get("cache") or {}),
-        _summarize_bucket(profile, "builder"),
-        _summarize_bucket(profile, "template", limit=3),
-        "; ".join(f"{label} x{count}" for label, count in sorted((profile.get("duplicates") or {}).items())) or "none",
-    )
-    return response
-
-
-def _profile_call(bucket: str, label: str, callback: Callable[[], Any], *, cache_state: Optional[str] = None) -> Any:
-    started_at = time.perf_counter()
-    try:
-        return callback()
-    finally:
-        _record_request_timing(bucket, label, (time.perf_counter() - started_at) * 1000.0, cache_state=cache_state)
-
-
-@contextmanager
-def _profile_block(bucket: str, label: str):
-    started_at = time.perf_counter()
-    try:
-        yield
-    finally:
-        _record_request_timing(bucket, label, (time.perf_counter() - started_at) * 1000.0)
-
-
-def _instrument_market_data_service(service: MarketDataService) -> None:
-    for method_name in ("get_provider_metadata", "get_same_day_intraday_candles", "get_fresh_same_day_intraday_candles", "get_intraday_candles_for_date"):
-        original = getattr(service, method_name, None)
-        if original is None or getattr(original, "_delphi_profiled", False):
-            continue
-
-        @wraps(original)
-        def wrapped_method(*args: Any, __original: Callable[..., Any] = original, __method_name: str = method_name, **kwargs: Any) -> Any:
-            return _profile_call("market", __method_name, lambda: __original(*args, **kwargs))
-
-        wrapped_method._delphi_profiled = True  # type: ignore[attr-defined]
-        setattr(service, method_name, wrapped_method)
-
-    for method_name, fresh in (("get_latest_snapshot", False), ("get_fresh_latest_snapshot", True)):
-        original = getattr(service, method_name, None)
-        if original is None or getattr(original, "_delphi_profiled", False):
-            continue
-
-        @wraps(original)
-        def wrapped_snapshot(
-            ticker: str,
-            *args: Any,
-            __original: Callable[..., Any] = original,
-            __method_name: str = method_name,
-            __fresh: bool = fresh,
-            **kwargs: Any,
-        ) -> Any:
-            cache_state = None
-            if has_request_context() and not __fresh and hasattr(service, "_get_request_market_data_cache"):
-                provider_key = service.live_provider.get_metadata().get("provider_key", "unknown")
-                request_cache = service._get_request_market_data_cache()  # type: ignore[attr-defined]
-                request_cache_key = f"{provider_key}:{ticker}:latest"
-                cache_state = "request-hit" if request_cache is not None and request_cache_key in request_cache else "request-miss"
-            result = None
-            started_at = time.perf_counter()
-            try:
-                result = __original(ticker, *args, **kwargs)
-                return result
-            finally:
-                if result is not None and cache_state is None:
-                    metadata = service.get_result_metadata(result)
-                    cache_state = str(metadata.get("source_type") or "unknown")
-                _record_request_timing("market", f"{__method_name}:{ticker}", (time.perf_counter() - started_at) * 1000.0, cache_state=cache_state)
-
-        wrapped_snapshot._delphi_profiled = True  # type: ignore[attr-defined]
-        setattr(service, method_name, wrapped_snapshot)
-
-
-def _instrument_trade_store(trade_store: TradeRepository) -> None:
-    for method_name in ("list_trades", "summarize", "get_trade", "get_trade_by_number", "next_trade_number"):
-        original = getattr(trade_store, method_name, None)
-        if original is None or getattr(original, "_delphi_profiled", False):
-            continue
-
-        @wraps(original)
-        def wrapped_trade_store(*args: Any, __original: Callable[..., Any] = original, __method_name: str = method_name, **kwargs: Any) -> Any:
-            label_suffix = ""
-            if args:
-                label_suffix = f":{args[0]}"
-            return _profile_call("trade", f"{__method_name}{label_suffix}", lambda: __original(*args, **kwargs))
-
-        wrapped_trade_store._delphi_profiled = True  # type: ignore[attr-defined]
-        setattr(trade_store, method_name, wrapped_trade_store)
-
-
-def _instrument_builder_method(target: Any, method_name: str, label: Optional[str] = None) -> None:
-    original = getattr(target, method_name, None)
-    if original is None or getattr(original, "_delphi_profiled", False):
-        return
-
-    builder_label = label or f"{type(target).__name__}.{method_name}"
-
-    @wraps(original)
-    def wrapped_builder(*args: Any, __original: Callable[..., Any] = original, __builder_label: str = builder_label, **kwargs: Any) -> Any:
-        return _profile_call("builder", __builder_label, lambda: __original(*args, **kwargs))
-
-    wrapped_builder._delphi_profiled = True  # type: ignore[attr-defined]
-    setattr(target, method_name, wrapped_builder)
-
-
-def _instrument_local_runtime_services(
-    *,
-    market_data_service: MarketDataService,
-    trade_store: TradeRepository,
-    apollo_service: ApolloService,
-    kairos_live_service: KairosService,
-    kairos_sim_service: KairosService,
-    performance_service: PerformanceDashboardService,
-    open_trade_manager: OpenTradeManager,
-    talos_service: Any,
-) -> None:
-    _instrument_market_data_service(market_data_service)
-    _instrument_trade_store(trade_store)
-    for target, method_names in (
-        (apollo_service, ("run_precheck", "build_management_context")),
-        (kairos_live_service, ("initialize_live_kairos_on_page_load", "get_dashboard_payload", "build_management_context")),
-        (kairos_sim_service, ("get_dashboard_payload", "build_management_context")),
-        (performance_service, ("build_dashboard",)),
-        (open_trade_manager, ("evaluate_open_trades",)),
-        (talos_service, ("get_dashboard_payload",)),
-    ):
-        for method_name in method_names:
-            _instrument_builder_method(target, method_name)
-
-
-def render_profiled_template(template_name: str, /, **context: Any) -> str:
-    return _profile_call("template", template_name, lambda: render_template(template_name, **context))
 
 
 @dataclass(frozen=True)
@@ -421,12 +184,14 @@ QUERY_DEFINITIONS = [
     QueryDefinition("vix_close_range", "VIX closing values for a date range", "range", "^VIX", "VIX", "range"),
 ]
 QUERY_LOOKUP = {definition.key: definition for definition in QUERY_DEFINITIONS}
-TRADE_MODE_LABELS = {"real": "Real Trades", "simulated": "Simulated Trades", "talos": "Talos"}
+TRADE_MODE_LABELS = {"real": "Real Trades", "simulated": "Simulated Trades", "talos": "Archive"}
 TRADE_MODE_DESCRIPTIONS = {
     "real": "Persistent live-trade log for real-world positions.",
     "simulated": "Persistent paper-trade log for simulated execution review.",
-    "talos": "Persistent autonomous local-only Talos trade log for simulated execution.",
+    "talos": "Archived compatibility rows are preserved inside the simulated journal and performance data.",
 }
+PUBLIC_TRADE_MODES = ("real", "simulated")
+LOCAL_SCHWAB_REDIRECT_URI = "https://127.0.0.1:5015/callback"
 TRADE_STATUS_OPTIONS = ["open", "closed", "expired", "cancelled"]
 TRADE_PROFILE_OPTIONS = ["Legacy", "Aggressive", "Fortress", "Standard", "Prime", "Subprime"]
 TRADE_OPTION_TYPE_OPTIONS = ["Put Credit Spread", "Call Credit Spread"]
@@ -517,110 +282,65 @@ def mask_oauth_state(value: Any) -> str:
     return f"{text[:6]}...{text[-4:]}"
 
 
-LOCAL_SCHWAB_REDIRECT_URI = "https://127.0.0.1:5001/callback"
-HOSTED_SCHWAB_REDIRECT_URI = "https://eigeltrade.com/callback"
-
-
-def is_loopback_redirect_uri(value: str) -> bool:
-    """Return whether a redirect URI points at a local development host."""
-    normalized_value = str(value or "").strip()
-    if not normalized_value:
-        return False
-    parsed = urllib.parse.urlparse(normalized_value)
-    hostname = str(parsed.hostname or "").strip().lower()
-    return hostname in LOCAL_DEV_HOSTS
-
-
-def resolve_schwab_redirect_uri(*, runtime_target: str, hosted_public_base_url: str, configured_redirect_uri: str) -> str:
-    """Resolve the active Schwab OAuth callback URI for the current runtime."""
-    normalized_runtime_target = str(runtime_target or "local").strip().lower() or "local"
-    normalized_hosted_public_base_url = str(hosted_public_base_url or "").strip()
-    normalized_configured_redirect_uri = str(configured_redirect_uri or "").strip()
-
-    if normalized_runtime_target == "hosted":
-        return HOSTED_SCHWAB_REDIRECT_URI
-
-    if normalized_configured_redirect_uri:
-        return normalized_configured_redirect_uri
-    return LOCAL_SCHWAB_REDIRECT_URI
-
-
-RUNTIME_APP_CONFIG_MAP = {
-    "RUNTIME_TARGET": "runtime_target",
-    "HOSTED_PUBLIC_BASE_URL": "hosted_public_base_url",
-    "SUPABASE_URL": "supabase_url",
-    "SUPABASE_PUBLISHABLE_KEY": "supabase_publishable_key",
-    "SUPABASE_SECRET_KEY": "supabase_secret_key",
-    "DELPHI_HOSTED_ALLOWED_EMAILS": "hosted_private_allowed_emails",
-    "DELPHI_HOSTED_ACCESS_TOKEN_COOKIE_NAME": "hosted_access_token_cookie_name",
-    "DELPHI_HOSTED_REFRESH_TOKEN_COOKIE_NAME": "hosted_refresh_token_cookie_name",
-    "APP_HOST": "app_host",
-    "APP_PORT": "app_port",
-    "APP_DISPLAY_NAME": "app_display_name",
-    "APP_PAGE_KICKER": "app_page_kicker",
-    "APP_VERSION_LABEL": "app_version_label",
-    "SESSION_COOKIE_NAME": "session_cookie_name",
-    "OAUTH_SESSION_NAMESPACE": "oauth_session_namespace",
-    "KAIROS_REPLAY_STORAGE_DIR": "kairos_replay_storage_dir",
-    "APP_LOG_PATH": "app_log_path",
-    "MARKET_DATA_PROVIDER": "market_data_provider",
-    "MARKET_DATA_LIVE_PROVIDER": "market_data_live_provider",
-    "VIX_HISTORICAL_PROVIDER": "vix_historical_provider",
-    "SPX_HISTORICAL_PROVIDER": "spx_historical_provider",
-    "APP_TIMEZONE": "app_timezone",
-    "APOLLO_ENABLED": "apollo_enabled",
-    "APOLLO_STRUCTURE_SOURCE": "apollo_structure_source",
-    "APOLLO_STRUCTURE_FALLBACK_SOURCE": "apollo_structure_fallback_source",
-    "APOLLO_OPTION_CHAIN_SOURCE": "apollo_option_chain_source",
-    "MACRO_PROVIDER": "macro_provider",
-    "APOLLO_ACCOUNT_VALUE": "apollo_account_value",
-    "APOLLO_ROUTINE_LOSS_MODIFIER": "apollo_routine_loss_modifier",
-    "FLASK_SECRET_KEY": "flask_secret_key",
-    "SCHWAB_CLIENT_ID": "schwab_client_id",
-    "SCHWAB_CLIENT_SECRET": "schwab_client_secret",
-    "SCHWAB_REDIRECT_URI": "schwab_redirect_uri",
-    "SCHWAB_AUTH_URL": "schwab_auth_url",
-    "SCHWAB_TOKEN_URL": "schwab_token_url",
-    "SCHWAB_BASE_URL": "schwab_base_url",
-    "SCHWAB_TOKEN_PATH": "schwab_token_path",
-    "SCHWAB_ES_PRIMARY_SYMBOL": "schwab_es_primary_symbol",
-    "SCHWAB_ES_FALLBACK_SYMBOL": "schwab_es_fallback_symbol",
-    "SCHWAB_SPX_OPTION_CHAIN_SYMBOL": "schwab_spx_option_chain_symbol",
-    "SCHWAB_HISTORY_PERIOD_TYPE": "schwab_history_period_type",
-    "SCHWAB_HISTORY_PERIOD": "schwab_history_period",
-    "SCHWAB_HISTORY_FREQUENCY_TYPE": "schwab_history_frequency_type",
-    "SCHWAB_HISTORY_FREQUENCY": "schwab_history_frequency",
-    "SCHWAB_HISTORY_NEED_EXTENDED_HOURS": "schwab_history_need_extended_hours",
-    "PUSHOVER_USER_KEY": "pushover_user_key",
-    "PUSHOVER_API_TOKEN": "pushover_api_token",
-}
-
-
 def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
     """Merge Flask app overrides into the cached environment config for runtime composition."""
     config_payload = asdict(base_config)
-    requested_runtime_config = dict(app.extensions.get("requested_runtime_config") or {})
-    for app_key, config_key in RUNTIME_APP_CONFIG_MAP.items():
+    app_config_map = {
+        "RUNTIME_TARGET": "runtime_target",
+        "HOSTED_PUBLIC_BASE_URL": "hosted_public_base_url",
+        "SUPABASE_URL": "supabase_url",
+        "SUPABASE_PUBLISHABLE_KEY": "supabase_publishable_key",
+        "SUPABASE_SECRET_KEY": "supabase_secret_key",
+        "DELPHI_HOSTED_ALLOWED_EMAILS": "hosted_private_allowed_emails",
+        "DELPHI_HOSTED_ACCESS_TOKEN_COOKIE_NAME": "hosted_access_token_cookie_name",
+        "DELPHI_HOSTED_REFRESH_TOKEN_COOKIE_NAME": "hosted_refresh_token_cookie_name",
+        "APP_HOST": "app_host",
+        "APP_PORT": "app_port",
+        "APP_DISPLAY_NAME": "app_display_name",
+        "APP_PAGE_KICKER": "app_page_kicker",
+        "APP_VERSION_LABEL": "app_version_label",
+        "SESSION_COOKIE_NAME": "session_cookie_name",
+        "OAUTH_SESSION_NAMESPACE": "oauth_session_namespace",
+        "KAIROS_REPLAY_STORAGE_DIR": "kairos_replay_storage_dir",
+        "APP_LOG_PATH": "app_log_path",
+        "MARKET_DATA_PROVIDER": "market_data_provider",
+        "MARKET_DATA_LIVE_PROVIDER": "market_data_live_provider",
+        "VIX_HISTORICAL_PROVIDER": "vix_historical_provider",
+        "SPX_HISTORICAL_PROVIDER": "spx_historical_provider",
+        "APP_TIMEZONE": "app_timezone",
+        "APOLLO_ENABLED": "apollo_enabled",
+        "APOLLO_STRUCTURE_SOURCE": "apollo_structure_source",
+        "APOLLO_STRUCTURE_FALLBACK_SOURCE": "apollo_structure_fallback_source",
+        "APOLLO_OPTION_CHAIN_SOURCE": "apollo_option_chain_source",
+        "MACRO_PROVIDER": "macro_provider",
+        "APOLLO_ACCOUNT_VALUE": "apollo_account_value",
+        "APOLLO_ROUTINE_LOSS_MODIFIER": "apollo_routine_loss_modifier",
+        "FLASK_SECRET_KEY": "flask_secret_key",
+        "SCHWAB_CLIENT_ID": "schwab_client_id",
+        "SCHWAB_CLIENT_SECRET": "schwab_client_secret",
+        "SCHWAB_REDIRECT_URI": "schwab_redirect_uri",
+        "SCHWAB_AUTH_URL": "schwab_auth_url",
+        "SCHWAB_TOKEN_URL": "schwab_token_url",
+        "SCHWAB_BASE_URL": "schwab_base_url",
+        "SCHWAB_TOKEN_PATH": "schwab_token_path",
+        "SCHWAB_ES_PRIMARY_SYMBOL": "schwab_es_primary_symbol",
+        "SCHWAB_ES_FALLBACK_SYMBOL": "schwab_es_fallback_symbol",
+        "SCHWAB_SPX_OPTION_CHAIN_SYMBOL": "schwab_spx_option_chain_symbol",
+        "SCHWAB_HISTORY_PERIOD_TYPE": "schwab_history_period_type",
+        "SCHWAB_HISTORY_PERIOD": "schwab_history_period",
+        "SCHWAB_HISTORY_FREQUENCY_TYPE": "schwab_history_frequency_type",
+        "SCHWAB_HISTORY_FREQUENCY": "schwab_history_frequency",
+        "SCHWAB_HISTORY_NEED_EXTENDED_HOURS": "schwab_history_need_extended_hours",
+        "PUSHOVER_USER_KEY": "pushover_user_key",
+        "PUSHOVER_API_TOKEN": "pushover_api_token",
+    }
+    for app_key, config_key in app_config_map.items():
         if app_key in app.config and app.config.get(app_key) is not None:
             config_payload[config_key] = app.config.get(app_key)
 
     runtime_target = str(config_payload.get("runtime_target") or "local").strip().lower() or "local"
     hosted_public_base_url = str(config_payload.get("hosted_public_base_url") or "").strip()
-    callback_runtime_target = str(
-        requested_runtime_config.get("runtime_target") or base_config.runtime_target or runtime_target or "local"
-    ).strip().lower() or "local"
-    callback_hosted_public_base_url = str(
-        requested_runtime_config.get("hosted_public_base_url") or base_config.hosted_public_base_url or hosted_public_base_url or ""
-    ).strip()
-    config_payload["runtime_target"] = runtime_target
-    config_payload["hosted_public_base_url"] = hosted_public_base_url
-    configured_redirect_uri = str(config_payload.get("schwab_redirect_uri") or "")
-    resolved_redirect_uri = resolve_schwab_redirect_uri(
-        runtime_target=callback_runtime_target,
-        hosted_public_base_url=callback_hosted_public_base_url,
-        configured_redirect_uri=configured_redirect_uri,
-    )
-    config_payload["schwab_redirect_uri"] = resolved_redirect_uri
+    configured_redirect_uri = str(config_payload.get("schwab_redirect_uri") or "").strip()
     strict_hosted_production = (
         runtime_target == "hosted"
         and not app.testing
@@ -630,36 +350,36 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
             or str(os.getenv("DELPHI_DEPLOYMENT_ENV") or "").strip().lower() == "production"
         )
     )
-    if runtime_target == "hosted" and configured_redirect_uri and configured_redirect_uri != resolved_redirect_uri:
-        logging.getLogger(__name__).warning(
-            "Hosted runtime forcing public Schwab redirect URI | configured_redirect_uri=%s | selected_redirect_uri=%s",
-            configured_redirect_uri,
-            resolved_redirect_uri,
-        )
-    if runtime_target == "hosted" and is_loopback_redirect_uri(configured_redirect_uri):
-        logging.getLogger(__name__).warning(
-            "Hosted runtime rejected loopback Schwab redirect URI | configured_redirect_uri=%s | selected_redirect_uri=%s",
-            configured_redirect_uri,
-            resolved_redirect_uri,
-        )
+
     if runtime_target == "hosted":
         normalized_hosted_public_base_url = hosted_public_base_url.rstrip("/")
-        if not normalized_hosted_public_base_url and strict_hosted_production:
+        if strict_hosted_production and not normalized_hosted_public_base_url:
             normalized_hosted_public_base_url = HOSTED_PRODUCTION_PUBLIC_BASE_URL
-            config_payload["hosted_public_base_url"] = normalized_hosted_public_base_url
         if strict_hosted_production and normalized_hosted_public_base_url != HOSTED_PRODUCTION_PUBLIC_BASE_URL:
             raise RuntimeError("Hosted production requires HOSTED_PUBLIC_BASE_URL=https://eigeltrade.com.")
+
+        if strict_hosted_production:
+            resolved_redirect_uri = HOSTED_PRODUCTION_CALLBACK_URL
+            if configured_redirect_uri and configured_redirect_uri != HOSTED_PRODUCTION_CALLBACK_URL:
+                raise RuntimeError("Hosted production rejects non-eigeltrade SCHWAB_REDIRECT_URI values.")
+        elif normalized_hosted_public_base_url:
+            resolved_redirect_uri = f"{normalized_hosted_public_base_url}/callback"
+        elif configured_redirect_uri:
+            resolved_redirect_uri = configured_redirect_uri
+        else:
+            resolved_redirect_uri = LOCAL_SCHWAB_REDIRECT_URI
+
+        config_payload["hosted_public_base_url"] = normalized_hosted_public_base_url
+        config_payload["schwab_redirect_uri"] = resolved_redirect_uri
         config_payload["schwab_token_path"] = "supabase://hosted_runtime_state/schwab_oauth_token/default"
-        if strict_hosted_production and str(config_payload.get("schwab_redirect_uri") or "").strip() != HOSTED_PRODUCTION_CALLBACK_URL:
+        if strict_hosted_production and resolved_redirect_uri != HOSTED_PRODUCTION_CALLBACK_URL:
             raise RuntimeError("Hosted production requires SCHWAB redirect_uri=https://eigeltrade.com/callback.")
+    elif configured_redirect_uri:
+        config_payload["schwab_redirect_uri"] = configured_redirect_uri
+    else:
+        config_payload["schwab_redirect_uri"] = LOCAL_SCHWAB_REDIRECT_URI
 
     return AppConfig(**config_payload)
-
-
-def apply_runtime_app_config_to_flask_config(app: Flask, runtime_app_config: AppConfig) -> None:
-    """Expose resolved runtime configuration through app.config for request-time route checks."""
-    runtime_payload = asdict(runtime_app_config)
-    app.config.update({app_key: runtime_payload[config_key] for app_key, config_key in RUNTIME_APP_CONFIG_MAP.items()})
 
 
 def get_runtime_app_config(app: Optional[Flask] = None) -> AppConfig:
@@ -671,6 +391,17 @@ def get_runtime_app_config(app: Optional[Flask] = None) -> AppConfig:
     return runtime_config
 
 
+def build_runtime_app_identity(app: Optional[Flask] = None) -> Dict[str, str]:
+    runtime_config = get_runtime_app_config(app)
+    container = _resolve_flask_container(app)
+    return {
+        "display_name": str(container.config.get("APP_DISPLAY_NAME") or runtime_config.app_display_name),
+        "page_kicker": str(container.config.get("APP_PAGE_KICKER") or runtime_config.app_page_kicker),
+        "version_label": str(container.config.get("APP_VERSION_LABEL") or runtime_config.app_version_label),
+        "session_cookie_name": str(container.config.get("SESSION_COOKIE_NAME") or runtime_config.session_cookie_name),
+    }
+
+
 def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     """Application factory."""
     app = Flask(__name__, instance_relative_config=True)
@@ -678,28 +409,11 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         normalized_test_config = dict(test_config)
         normalized_test_config.setdefault("RUNTIME_TARGET", "local")
         app.config.update(normalized_test_config)
-    app.extensions["requested_runtime_config"] = {
-        "runtime_target": str(app.config.get("RUNTIME_TARGET") or APP_CONFIG.runtime_target or "local").strip().lower() or "local",
-        "hosted_public_base_url": str(app.config.get("HOSTED_PUBLIC_BASE_URL") or APP_CONFIG.hosted_public_base_url or "").strip(),
-    }
-    app.config.setdefault("RUNTIME_TARGET", "local")
-    app.config.setdefault("APP_HOST", "127.0.0.1")
-    app.config.setdefault("HOSTED_PUBLIC_BASE_URL", "")
-    app.config.setdefault("APP_PORT", 5001)
-    app.config.setdefault("SCHWAB_REDIRECT_URI", LOCAL_SCHWAB_REDIRECT_URI)
     runtime_app_config = resolve_runtime_app_config(app, APP_CONFIG)
-    apply_runtime_app_config_to_flask_config(app, runtime_app_config)
     host_infrastructure_assembler = select_host_infrastructure_assembler(app, runtime_app_config)
     host_infrastructure = host_infrastructure_assembler.assemble(app)
     configure_logging(app, host_infrastructure)
     runtime_app_config = resolve_runtime_app_config(app, APP_CONFIG)
-    apply_runtime_app_config_to_flask_config(app, runtime_app_config)
-    app.logger.info(
-        "Runtime callback config | runtime_target=%s | hosted_public_base_url=%s | schwab_redirect_uri=%s",
-        runtime_app_config.runtime_target,
-        runtime_app_config.hosted_public_base_url or "missing",
-        runtime_app_config.schwab_redirect_uri or "missing",
-    )
     runtime_profile = select_runtime_profile(app, runtime_app_config)
     launch_behavior = WebBrowserLaunchBehavior()
     lifecycle_coordinator = LocalRuntimeLifecycleCoordinator(
@@ -765,17 +479,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     performance_service = service_bundle.performance_service
     performance_engine = service_bundle.performance_engine
     open_trade_manager = service_bundle.open_trade_manager
-    talos_service = service_bundle.talos_service
-    _instrument_local_runtime_services(
-        market_data_service=market_data_service,
-        trade_store=trade_store,
-        apollo_service=apollo_service,
-        kairos_live_service=kairos_live_service,
-        kairos_sim_service=kairos_sim_service,
-        performance_service=performance_service,
-        open_trade_manager=open_trade_manager,
-        talos_service=talos_service,
-    )
     trade_notification_repository = build_trade_notification_repository(app, trade_store)
     trade_notification_repository.initialize()
     global_notification_settings_repository = build_global_notification_settings_repository(app, trade_store)
@@ -803,7 +506,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     app.extensions["kairos_sim_service"] = kairos_sim_service
     app.extensions["kairos_scenario_repository"] = kairos_scenario_repository
     app.extensions["kairos_scenario_repository_backend"] = kairos_scenario_repository_backend
-    app.extensions["talos_service"] = talos_service
     app.extensions["import_preview_repository"] = import_preview_repository
     app.extensions["workflow_state"] = workflow_state
     app.extensions["request_identity_resolver"] = request_identity_resolver
@@ -819,6 +521,14 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     app.extensions["performance_service"] = performance_service
     app.extensions["performance_engine"] = performance_engine
     app.extensions["open_trade_manager"] = open_trade_manager
+    app.extensions["strategy_snapshots"] = getattr(
+        service_bundle,
+        "strategy_snapshots",
+        {
+            "apollo": apollo_snapshot_repository,
+            "kairos": kairos_snapshot_repository,
+        },
+    )
     app.extensions["trade_notification_repository"] = trade_notification_repository
     app.extensions["pushover_service"] = pushover_service
     app.extensions["oauth_session_keys"] = build_oauth_session_keys(app.config["OAUTH_SESSION_NAMESPACE"])
@@ -831,49 +541,24 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.before_request
     def resolve_request_identity_for_runtime() -> None:
-        _ensure_request_profile()
         g.request_identity = get_request_identity_resolver(app).resolve_request_identity(request)
-
-    @app.before_request
-    def reject_removed_hosted_surface() -> Any:
-        if app.config.get("RUNTIME_TARGET") != "hosted":
-            if request.path.startswith("/hosted"):
-                abort(404)
-            if request.path in {"/sign-in", "/sign-out", "/private-access-check"}:
-                abort(404)
-        return None
-
-    @app.before_request
-    def enforce_unified_hosted_private_access() -> Any:
-        return None
-
-    @app.after_request
-    def log_local_request_profile(response: Any) -> Any:
-        return _log_request_profile(response)
 
     @app.context_processor
     def inject_universal_header_status() -> Dict[str, Any]:
-        with _profile_block("builder", "build_startup_menu_payload"):
-            menu_status = build_startup_menu_payload(
+        return {
+            "menu_status": build_startup_menu_payload(
                 market_data_service,
                 snapshot_overrides=getattr(g, "startup_menu_snapshot_overrides", None),
-            )
-        return {
-            "menu_status": menu_status,
-            "delphi_routes": build_delphi_route_map(),
-            "app_identity": {
-                "display_name": app.config["APP_DISPLAY_NAME"],
-                "page_kicker": app.config["APP_PAGE_KICKER"],
-                "version_label": app.config["APP_VERSION_LABEL"],
-                "session_cookie_name": app.config["SESSION_COOKIE_NAME"],
-            },
+            ),
+            "delphi_routes": build_delphi_route_map(hosted=app.config.get("RUNTIME_TARGET") == "hosted"),
+            "app_identity": build_runtime_app_identity(app),
             "request_identity": get_request_identity(),
-            "header_status_items": [],
-            "session_sign_out_url": "",
         }
 
     @app.route("/", methods=["GET", "POST"])
     def index() -> str:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_device_launch"))
         if request.method == "POST":
             return app.view_functions["research"]()
         return redirect(url_for("open_trade_management_page"))
@@ -892,7 +577,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         page_copy: str,
         **template_context: Any,
     ) -> str:
-        return render_profiled_template(
+        return render_template(
             "index.html",
             query_options=QUERY_DEFINITIONS,
             form_data=form_data,
@@ -912,6 +597,10 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.route("/research", methods=["GET", "POST"])
     def research() -> str:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            if request.method == "POST":
+                return app.view_functions["hosted_research"]()
+            return redirect(url_for("hosted_research"))
         form_data = get_form_data(request.form if request.method == "POST" else None)
         result = None
         error_message = None
@@ -956,18 +645,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             page_heading="Research",
             page_copy="Live and historical SPX / VIX research workspace with provider-aware routing and export-ready lookup tools.",
         )
-
-    @app.route("/private-access-check", methods=["GET"])
-    def unified_private_access_check() -> Any:
-        abort(404)
-
-    @app.route("/sign-in", methods=["GET", "POST"])
-    def unified_sign_in() -> Any:
-        abort(404)
-
-    @app.route("/sign-out", methods=["POST"])
-    def unified_sign_out() -> Any:
-        abort(404)
 
     @app.route("/hosted/research", methods=["GET", "POST"])
     def hosted_research() -> str:
@@ -1057,10 +734,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         if app.config.get("RUNTIME_TARGET") != "hosted":
             abort(404)
         next_path = sanitize_hosted_next_path(request.values.get("next"))
-        active_branch = resolve_hosted_device_branch(request.values.get("view") or get_hosted_device_branch(default="desktop"))
-        if request.method == "POST":
-            return hosted_branch_login(active_branch)
-        return redirect(url_for("hosted_branch_login", branch=active_branch, next=next_path))
+        return redirect(build_hosted_launch_url(next_path=next_path, view=request.values.get("view")))
 
     @app.route("/hosted/login/<branch>", methods=["GET", "POST"])
     def hosted_branch_login(branch: str) -> Any:
@@ -1100,6 +774,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 return browser_response
             response = redirect(build_hosted_branch_destination(active_branch, next_path=next_path))
             get_hosted_session_authenticator(app).establish_response_session(response, hosted_session)
+            clear_hosted_force_reauth()
             remember_hosted_browser_session(identity)
             remember_hosted_device_branch(active_branch)
             establish_hosted_browser_cache_session(identity, response, app=app)
@@ -1137,6 +812,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     def hosted_device_launch() -> Any:
         if app.config.get("RUNTIME_TARGET") != "hosted":
             abort(404)
+        app_identity = build_runtime_app_identity(app)
         next_path = sanitize_hosted_next_path(request.args.get("next"))
         explicit_view = normalize_hosted_device_branch(request.args.get("view"))
         if explicit_view:
@@ -1177,11 +853,18 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             if authenticated
             else build_hosted_login_url("mobile", next_path=next_path)
         )
-        preferred_branch = preferred_view or "desktop"
-        return redirect(
-            build_hosted_branch_destination(preferred_branch, next_path=next_path)
-            if authenticated
-            else build_hosted_login_url(preferred_branch, next_path=next_path)
+        return render_template(
+            "hosted_device_launch.html",
+            page_browser_title=f"{app_identity['display_name']} Portal",
+            desktop_target=desktop_target,
+            mobile_target=mobile_target,
+            explicit_view=explicit_view,
+            preferred_view=preferred_view,
+            authenticated=authenticated,
+            mobile_breakpoint=HOSTED_MOBILE_PHONE_MAX_WIDTH + 1,
+            desktop_home_url=build_hosted_branch_destination("desktop", next_path=next_path),
+            mobile_home_url=build_hosted_branch_destination("mobile", next_path=next_path),
+            **(build_hosted_template_context(identity, app=app) if identity is not None else {}),
         )
 
     def render_hosted_mobile_shell(active_tab: str) -> Any:
@@ -1403,43 +1086,17 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     def hosted_browser_sign_out() -> Any:
         if app.config.get("RUNTIME_TARGET") != "hosted":
             abort(404)
-        preferred_branch = get_hosted_device_branch(default="")
-        response = redirect(build_hosted_login_url(preferred_branch))
+        response = redirect(build_hosted_launch_url())
         invalidate_hosted_browser_cache_session(response, app=app)
         clear_hosted_browser_session()
-        get_session_invalidator(app).invalidate_response(response)
-        return response
-
-    @app.route("/hosted/schwab-logout", methods=["POST"])
-    def hosted_schwab_logout() -> Any:
-        if app.config.get("RUNTIME_TARGET") != "hosted":
-            abort(404)
-        provider = market_data_service.provider
-        if hasattr(provider, "auth_service") and hasattr(provider.auth_service, "clear_tokens"):
-            provider.auth_service.clear_tokens()
-        oauth_session_keys = app.extensions["oauth_session_keys"]
-        workflow_state = get_workflow_state(app)
-        workflow_state.put(oauth_session_keys["login_in_progress"], False)
-        workflow_state.put(oauth_session_keys["callback_pending"], False)
-        workflow_state.put(oauth_session_keys["connected"], False)
-        workflow_state.put(oauth_session_keys["authorized"], False)
-        workflow_state.pop(oauth_session_keys["oauth_state"], None)
-        workflow_state.pop(oauth_session_keys["pkce_verifier"], None)
-        workflow_state.pop(HOSTED_SCHWAB_POST_AUTH_REDIRECT_KEY, None)
-        _clear_hosted_payload_cache(app=app)
-        set_status_message(
-            "Schwab session cleared. Sign in again with beigel77@gmail.com before reconnecting to Schwab.",
-            level="info",
-        )
-        preferred_branch = get_hosted_device_branch(default="desktop")
-        response = redirect(build_hosted_login_url(preferred_branch))
-        invalidate_hosted_browser_cache_session(response, app=app)
-        clear_hosted_browser_session()
+        mark_hosted_force_reauth()
         get_session_invalidator(app).invalidate_response(response)
         return response
 
     @app.route("/hosted/actions/open-trades", methods=["GET"])
     def hosted_open_trades_action() -> Any:
+        if app.config.get("RUNTIME_TARGET") != "hosted":
+            abort(404)
         requested_trade_mode = str(request.args.get("trade_mode") or "").strip().lower()
         trade_mode_filter = "all" if not requested_trade_mode else resolve_hosted_trade_mode_filter(requested_trade_mode)
         try:
@@ -1454,6 +1111,20 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             payload.get("open_trade_count"),
         )
         return jsonify(payload)
+
+    @app.route("/hosted/actions/journal-trades", methods=["GET"])
+    def hosted_journal_trades_action() -> Any:
+        _, error_response = authorize_hosted_private_action_request(app)
+        if error_response is not None:
+            return error_response
+        requested_trade_mode = str(request.args.get("trade_mode") or "").strip().lower()
+        trade_mode_filter = "all" if not requested_trade_mode else resolve_hosted_trade_mode_filter(requested_trade_mode)
+        try:
+            return jsonify(build_hosted_journal_trades_action_response(trade_mode=trade_mode_filter, app=app))
+        except SupabaseRequestError as exc:
+            if not is_missing_hosted_trade_table_error(exc):
+                raise
+            return jsonify(build_hosted_schema_error_payload("journal", exc, trade_mode=trade_mode_filter)), 503
 
     @app.route("/hosted/actions/performance-summary", methods=["GET"])
     def hosted_performance_summary_action() -> Any:
@@ -1546,15 +1217,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         identity, error_response = authorize_hosted_private_browser_request(app)
         if error_response is not None:
             return error_response
-        dev_sync_panel = build_hosted_delphi4_sync_panel_context(identity, app=app)
-        return render_template(
-            "home.html",
-            info_message=pop_status_message(),
-            hosted_delphi4_sync_panel=dev_sync_panel,
-            **build_hosted_template_context(identity, app=app),
-        )
+        return redirect(url_for("hosted_shell_manage_trades"))
 
-    @app.route("/dev/sync-delphi4", methods=["POST"])
     @app.route("/hosted/dev/sync-delphi4", methods=["POST"])
     def hosted_delphi4_sync_action() -> Any:
         identity, error_response = authorize_hosted_private_browser_request(app)
@@ -1574,22 +1238,18 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 dry_run=dry_run,
             )
             result_payload = {"ok": True, **result.to_payload()}
-            remember_hosted_delphi4_sync_result(result_payload)
             if dry_run:
                 set_status_message(build_delphi4_sync_flash_message(result_payload, dry_run=True), level="info")
             else:
                 set_status_message(build_delphi4_sync_flash_message(result_payload, dry_run=False), level="info")
         except FileNotFoundError as exc:
-            remember_hosted_delphi4_sync_result({"ok": False, "error": str(exc)})
             set_status_message(str(exc), level="warning")
         except RuntimeError as exc:
-            remember_hosted_delphi4_sync_result({"ok": False, "error": str(exc)})
             set_status_message(str(exc), level="warning")
         except SupabaseRequestError as exc:
             app.logger.warning("Delphi 4.3 sync failed due to Supabase error: %s", exc)
-            remember_hosted_delphi4_sync_result({"ok": False, "error": f"{HOSTED_APP_DISPLAY_NAME} could not reach Supabase during the sync."})
             set_status_message(f"{HOSTED_APP_DISPLAY_NAME} could not reach Supabase during the sync.", level="warning")
-        return redirect(url_for("index"))
+        return redirect(url_for("hosted_shell_manage_trades"))
 
     @app.route("/hosted/performance", methods=["GET"])
     def hosted_shell_performance() -> Any:
@@ -1887,29 +1547,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         set_status_message("Trade not found.", level="error")
         return redirect(url_for("hosted_shell_journal", trade_mode=normalized_mode))
 
-    @app.post("/hosted/journal/refresh-from-supabase")
-    def hosted_journal_refresh_from_supabase() -> Any:
-        identity, error_response = authorize_hosted_private_browser_request(app)
-        if error_response is not None:
-            return error_response
-        trade_mode = resolve_trade_mode(request.form.get("trade_mode") or "real")
-        try:
-            _execute_supabase_refresh(app)
-        except Exception as exc:
-            set_status_message(f"Supabase refresh failed: {exc}", level="warning")
-        return redirect(url_for("hosted_shell_journal", trade_mode=trade_mode))
-
-    @app.post("/hosted/manage-trades/refresh-from-supabase")
-    def hosted_manage_trades_refresh_from_supabase() -> Any:
-        identity, error_response = authorize_hosted_private_browser_request(app)
-        if error_response is not None:
-            return error_response
-        try:
-            _execute_supabase_refresh(app)
-        except Exception as exc:
-            set_status_message(f"Supabase refresh failed: {exc}", level="warning")
-        return redirect(url_for("hosted_shell_manage_trades"))
-
     @app.route("/hosted/open-trades", methods=["GET"])
     def hosted_shell_open_trades() -> Any:
         identity, error_response = authorize_hosted_private_browser_request(app)
@@ -1943,7 +1580,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 "real_status_update": url_for("hosted_open_trade_management_status_update", trade_mode="real"),
                 "simulated_status_update": url_for("hosted_open_trade_management_status_update", trade_mode="simulated"),
                 "prefill_close": "hosted_open_trade_management_prefill_close",
-                "refresh_supabase": url_for("hosted_manage_trades_refresh_from_supabase"),
             },
             suppress_open_positions_copy=True,
             hosted_admin_error=admin_error,
@@ -2126,9 +1762,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                     app.logger.exception("Unexpected hosted Apollo autorun error: %s", exc)
         apollo_render_state = resolve_hosted_apollo_render_state(app=app)
         apollo_result = apollo_render_state["payload"]
-        diagnostic_message = None
-        if apollo_result is None and error_message is None:
-            diagnostic_message = "Apollo output is not available yet. Use Run Apollo to execute a live pass."
         app.logger.info(
             "Hosted Apollo desktop render | route_entered=%s | payload_source=%s | payload_id=%s | cache_key=%s | source_object=%s",
             request.path,
@@ -2144,7 +1777,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             apollo_result=apollo_result,
             error_message=error_message,
             info_message=info_message,
-            diagnostic_message=diagnostic_message,
+            diagnostic_message=None,
             active_page="apollo",
             page_browser_title="Apollo | Delphi",
             page_heading="Apollo",
@@ -2337,7 +1970,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     def render_kairos_workspace(*, workspace: str, service: KairosService) -> str:
         kairos_payload = service.initialize_live_kairos_on_page_load() if workspace == "live" else service.get_dashboard_payload()
-        return render_profiled_template(
+        return render_template(
             "kairos.html",
             kairos_payload=kairos_payload,
             workspace=workspace,
@@ -2359,21 +1992,24 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.get("/kairos")
     def kairos_placeholder() -> Any:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_kairos_live_page"))
         return redirect(url_for("kairos_live_page"))
 
     @app.get("/kairos/live")
     def kairos_live_page() -> str:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_kairos_live_page"))
         return render_kairos_workspace(workspace="live", service=kairos_live_service)
 
     @app.get("/kairos/sim")
     def kairos_sim_page() -> str:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_kairos_sim_page"))
         return render_kairos_workspace(workspace="sim", service=kairos_sim_service)
 
-    @app.get("/kairos/status")
-    def kairos_status() -> Any:
-        return jsonify(kairos_live_service.get_dashboard_payload())
-
-    @app.get("/kairos/live/status")
+    @app.get("/kairos/status", endpoint="kairos_status")
+    @app.get("/kairos/live/status", endpoint="kairos_live_status")
     def kairos_live_status() -> Any:
         return jsonify(kairos_live_service.get_dashboard_payload())
 
@@ -2414,11 +2050,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         response_payload["message_body"] = message
         return jsonify(response_payload), status_code
 
-    @app.post("/kairos/activate")
-    def kairos_activate() -> Any:
-        return jsonify(kairos_live_service.activate_for_today())
-
-    @app.post("/kairos/live/activate")
+    @app.post("/kairos/activate", endpoint="kairos_activate")
+    @app.post("/kairos/live/activate", endpoint="kairos_live_activate")
     def kairos_live_activate() -> Any:
         return jsonify(kairos_live_service.activate_for_today())
 
@@ -2454,11 +2087,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         payload = normalize_kairos_workspace_payload("sim", get_request_payload())
         return jsonify(kairos_sim_service.start_simulation_runner(payload))
 
-    @app.post("/kairos/runner/pause")
-    def kairos_runner_pause() -> Any:
-        return jsonify(kairos_live_service.pause_simulation_runner())
-
-    @app.post("/kairos/live/runner/pause")
+    @app.post("/kairos/runner/pause", endpoint="kairos_runner_pause")
+    @app.post("/kairos/live/runner/pause", endpoint="kairos_live_runner_pause")
     def kairos_live_runner_pause() -> Any:
         return jsonify(kairos_live_service.pause_simulation_runner())
 
@@ -2526,11 +2156,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         payload["pause_on_exit_gates"] = True
         return jsonify(kairos_sim_service.take_simulation_trade_candidate(payload))
 
-    @app.post("/kairos/runner/candidate/ignore")
-    def kairos_runner_candidate_ignore() -> Any:
-        return jsonify(kairos_live_service.ignore_simulation_trade_candidate())
-
-    @app.post("/kairos/live/runner/candidate/ignore")
+    @app.post("/kairos/runner/candidate/ignore", endpoint="kairos_runner_candidate_ignore")
+    @app.post("/kairos/live/runner/candidate/ignore", endpoint="kairos_live_runner_candidate_ignore")
     def kairos_live_runner_candidate_ignore() -> Any:
         return jsonify(kairos_live_service.ignore_simulation_trade_candidate())
 
@@ -2546,11 +2173,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     def kairos_sim_runner_exit_skip() -> Any:
         return jsonify(kairos_sim_service.skip_simulation_exit_gate())
 
-    @app.post("/kairos/runner/end")
-    def kairos_runner_end() -> Any:
-        return jsonify(kairos_live_service.end_simulation_runner())
-
-    @app.post("/kairos/live/runner/end")
+    @app.post("/kairos/runner/end", endpoint="kairos_runner_end")
+    @app.post("/kairos/live/runner/end", endpoint="kairos_live_runner_end")
     def kairos_live_runner_end() -> Any:
         return jsonify(kairos_live_service.end_simulation_runner())
 
@@ -2563,11 +2187,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         payload = get_request_payload()
         return jsonify(kairos_sim_service.import_historical_replay_template(payload))
 
-    @app.post("/kairos/best-trade")
-    def kairos_best_trade() -> Any:
-        return jsonify(kairos_live_service.request_best_trade_override())
-
-    @app.post("/kairos/live/best-trade")
+    @app.post("/kairos/best-trade", endpoint="kairos_best_trade")
+    @app.post("/kairos/live/best-trade", endpoint="kairos_live_best_trade")
     def kairos_live_best_trade() -> Any:
         return jsonify(kairos_live_service.request_best_trade_override())
 
@@ -2587,11 +2208,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     def kairos_sim_runner_best_trade() -> Any:
         return jsonify(build_kairos_runner_response(kairos_sim_service.request_best_trade_override()))
 
-    @app.post("/kairos/stop")
-    def kairos_stop() -> Any:
-        return jsonify(kairos_live_service.stop_for_today())
-
-    @app.post("/kairos/live/stop")
+    @app.post("/kairos/stop", endpoint="kairos_stop")
+    @app.post("/kairos/live/stop", endpoint="kairos_live_stop")
     def kairos_live_stop() -> Any:
         return jsonify(kairos_live_service.stop_for_today())
 
@@ -2612,7 +2230,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             try:
                 apollo_result = execute_apollo_precheck(apollo_service, trigger_source=trigger_source)
                 if apollo_result is not None:
-                    g.startup_menu_snapshot_overrides = dict(apollo_result.get("header_market_snapshots") or {})
                     save_apollo_snapshot(apollo_result, app=app)
                     app.logger.info("Completed Apollo pre-check via %s", trigger_source)
             except MarketDataReauthenticationRequired as exc:
@@ -2628,12 +2245,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             except Exception as exc:  # pragma: no cover - defensive logging
                 error_message = "An unexpected error occurred while running Apollo. Check the log for details."
                 app.logger.exception("Unexpected Apollo error: %s", exc)
-
-        if apollo_result is None and error_message is None:
-            diagnostic_message = (
-                "Apollo output is not available yet for this request. "
-                "Use /apollo?autorun=1 or run Apollo from the page action to load Gate output."
-            )
 
         response = render_research_page(
             form_data=form_data,
@@ -2672,7 +2283,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             return jsonify({"ok": False, "error": "Unexpected Apollo debug error."}), 500
 
         if request.args.get("format", "json").strip().lower() == "html":
-            g.startup_menu_snapshot_overrides = dict(apollo_result.get("header_market_snapshots") or {})
             return render_research_page(
                 form_data=get_form_data(None),
                 result=None,
@@ -2737,12 +2347,9 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         workflow_state.put(oauth_session_keys["callback_pending"], True)
         workflow_state.put(oauth_session_keys["connected"], False)
         workflow_state.put(oauth_session_keys["authorized"], False)
-        workflow_state.put(HOSTED_SCHWAB_POST_AUTH_REDIRECT_KEY, resolve_post_schwab_redirect_target(app=app))
         app.logger.info(
-            "OAuth state created | runtime_target=%s | env=%s | hosted_public_base_url=%s | port=%s | redirect_uri=%s | token_target_path=%s | session_cookie=%s | oauth_namespace=%s | oauth_state=%s",
-            runtime_app_config.runtime_target,
+            "OAuth state created | env=%s | port=%s | redirect_uri=%s | token_target_path=%s | session_cookie=%s | oauth_namespace=%s | oauth_state=%s",
             runtime_app_config.app_display_name,
-            runtime_app_config.hosted_public_base_url or "missing",
             runtime_app_config.app_port,
             runtime_app_config.schwab_redirect_uri,
             getattr(auth_service.token_store, "file_path", runtime_app_config.schwab_token_path),
@@ -2753,13 +2360,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
         try:
             authorize_url = auth_service.build_authorization_url(state=state)
-            app.logger.info(
-                "Schwab authorize URL | runtime_target=%s | hosted_public_base_url=%s | redirect_uri=%s | authorize_url=%s",
-                runtime_app_config.runtime_target,
-                runtime_app_config.hosted_public_base_url or "missing",
-                runtime_app_config.schwab_redirect_uri,
-                authorize_url,
-            )
+            app.logger.info("Schwab authorize URL | %s", authorize_url)
             return redirect(authorize_url)
         except Exception as exc:
             workflow_state.put(oauth_session_keys["login_in_progress"], False)
@@ -2777,7 +2378,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
         oauth_session_keys = app.extensions["oauth_session_keys"]
         workflow_state = get_workflow_state(app)
-        post_auth_redirect = str(workflow_state.pop(HOSTED_SCHWAB_POST_AUTH_REDIRECT_KEY, "") or "").strip()
         received_state = request.args.get("state")
         authorization_code = request.args.get("code")
         app.logger.info(
@@ -2842,23 +2442,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             workflow_state.put(oauth_session_keys["connected"], True)
             workflow_state.put(oauth_session_keys["authorized"], True)
             workflow_state.pop(oauth_session_keys["pkce_verifier"], None)
-            if app.config.get("RUNTIME_TARGET") == "hosted":
-                try:
-                    diagnostics = refresh_from_supabase_truth(app=app)
-                    set_status_message(
-                        "Connected to Schwab successfully. Refreshed Supabase truth tables "
-                        f"(max trade #{diagnostics['max_trade_number']}, active trades {diagnostics['active_trades_count']}).",
-                        level="info",
-                    )
-                except Exception as exc:
-                    _clear_hosted_payload_cache(app=app)
-                    app.logger.warning("Hosted Supabase truth refresh failed after Schwab callback: %s", exc)
-                    set_status_message(
-                        "Connected to Schwab successfully, but the hosted Supabase refresh failed. Reload the hosted page to retry.",
-                        level="warning",
-                    )
-            else:
-                set_status_message("Connected to Schwab successfully.", level="info")
+            set_status_message("Connected to Schwab successfully.", level="info")
         except Exception as exc:
             workflow_state.put(oauth_session_keys["login_in_progress"], False)
             workflow_state.put(oauth_session_keys["callback_pending"], False)
@@ -2867,13 +2451,13 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             set_status_message(str(exc), level="error")
             app.logger.warning("Schwab token exchange failed: %s", exc)
 
-        if app.config.get("RUNTIME_TARGET") == "hosted":
-            return redirect(sanitize_hosted_next_path(post_auth_redirect) if post_auth_redirect else url_for("hosted_shell_home"))
         return redirect(url_for("index"))
 
     @app.get("/trades/<trade_mode>")
     def trade_dashboard(trade_mode: str):
         normalized_mode = resolve_trade_mode(trade_mode)
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_shell_journal", trade_mode=normalized_mode, **request.args.to_dict(flat=False)))
         prefill_requested = str(request.args.get("prefill", "")).strip().lower() in {"1", "true", "yes", "on"}
         form_values = blank_trade_form(normalized_mode)
         form_values["trade_number"] = str(trade_store.next_trade_number())
@@ -2891,7 +2475,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 prefill_notice = prefill_meta["notice"]
                 prefill_active = True
 
-        return render_profiled_template(
+        return render_template(
             "trades.html",
             **build_trade_page_context(
                 store=trade_store,
@@ -3194,8 +2778,10 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.get("/performance")
     def performance_dashboard() -> str:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_shell_performance", **request.args.to_dict(flat=False)))
         dashboard_payload = performance_service.build_dashboard()
-        return render_profiled_template(
+        return render_template(
             "performance.html",
             dashboard_payload=dashboard_payload,
             filter_groups=PERFORMANCE_FILTER_GROUPS,
@@ -3204,9 +2790,11 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.get("/management/open-trades")
     def open_trade_management_page() -> str:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_shell_manage_trades", **request.args.to_dict(flat=False)))
         management_payload = open_trade_manager.evaluate_open_trades(send_alerts=False)
         g.startup_menu_snapshot_overrides = dict(management_payload.get("header_market_snapshots") or {})
-        response = render_profiled_template(
+        response = render_template(
             "open_trade_management.html",
             management_payload=management_payload,
             info_message=pop_status_message(),
@@ -3218,48 +2806,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             },
         )
         return response
-
-    @app.get("/talos")
-    def talos_dashboard_page() -> str:
-        talos_payload = talos_service.get_dashboard_payload()
-        g.startup_menu_snapshot_overrides = dict(talos_payload.get("header_market_snapshots") or {})
-        return render_profiled_template(
-            "talos.html",
-            talos_payload=talos_payload,
-            info_message=pop_status_message(),
-        )
-
-    @app.post("/talos/run-cycle")
-    def talos_run_cycle() -> Any:
-        payload = talos_service.run_cycle(trigger_reason="manual")
-        set_status_message(
-            f"Talos cycle completed with {payload.get('open_trade_count') or 0} open Talos trade(s).",
-            level="info",
-        )
-        return redirect(url_for("talos_dashboard_page"))
-
-    @app.post("/talos/reset")
-    def talos_reset() -> Any:
-        raw_starting_balance = str(request.form.get("new_starting_balance") or "").strip()
-        try:
-            new_starting_balance = float(raw_starting_balance)
-        except (TypeError, ValueError):
-            new_starting_balance = 0.0
-        if new_starting_balance <= 0:
-            set_status_message(
-                "Talos reset requires a new starting balance greater than zero. No Talos trades or logs were cleared.",
-                level="warning",
-            )
-            return redirect(url_for("talos_dashboard_page"))
-        result = talos_service.reset_state(new_starting_balance=new_starting_balance)
-        set_status_message(
-            (
-                f"Talos reset cleared {result.get('deleted_trade_count') or 0} Talos trade(s), reset the settled starting balance to "
-                f"${new_starting_balance:,.2f}, and archived the prior Talos logs/history at {result.get('archive_path') or 'the Talos recovery folder'}."
-            ),
-            level="warning",
-        )
-        return redirect(url_for("talos_dashboard_page"))
 
     @app.get("/notifications")
     def notifications_settings_page() -> str:
@@ -3352,6 +2898,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.get("/performance-summary")
     def performance_summary() -> str:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_shell_performance", **request.args.to_dict(flat=False)))
         enriched_trades = performance_engine.load_trades()
         return render_template(
             "performance_summary.html",
@@ -3431,7 +2979,6 @@ def configure_logging(app: Flask, host_infrastructure: Any | None = None) -> Non
     file_handler.setFormatter(formatter)
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
-    stream_handler.addFilter(_RepeatedInfoFilter())
 
     for handler in app.logger.handlers:
         handler.close()
@@ -3458,20 +3005,12 @@ def build_startup_menu_payload(
     snapshot_overrides: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Return fresh startup-menu status cards for Delphi's command hub."""
-    snapshot_overrides = snapshot_overrides or {}
-    use_local_cache = bool(not snapshot_overrides and has_app_context() and current_app.config.get("RUNTIME_TARGET") != "hosted")
-    if use_local_cache:
-        cached_entry = current_app.extensions.get(STARTUP_MENU_CACHE_EXTENSION_KEY)
-        if isinstance(cached_entry, dict) and float(cached_entry.get("expires_at", 0.0)) >= time.monotonic():
-            cached_payload = cached_entry.get("payload")
-            if isinstance(cached_payload, dict):
-                return copy.deepcopy(cached_payload)
-
     provider_meta = market_data_service.get_provider_metadata()
     requires_auth = bool(provider_meta.get("requires_auth"))
     authenticated = bool(provider_meta.get("authenticated", True))
     notes: list[str] = []
     auth_status = {"requires_login": False, "requires_refresh": False}
+    snapshot_overrides = snapshot_overrides or {}
 
     def _snapshot_card(label: str, ticker: str, key: str) -> Dict[str, str]:
         try:
@@ -3547,7 +3086,7 @@ def build_startup_menu_payload(
         }
     )
 
-    payload = {
+    return {
         "brand_name": "Delphi",
         "connection_label": connection_label,
         "connection_meta": connection_meta,
@@ -3555,12 +3094,6 @@ def build_startup_menu_payload(
         "cards": cards,
         "notes": notes,
     }
-    if use_local_cache:
-        current_app.extensions[STARTUP_MENU_CACHE_EXTENSION_KEY] = {
-            "expires_at": time.monotonic() + STARTUP_MENU_CACHE_SECONDS,
-            "payload": copy.deepcopy(payload),
-        }
-    return payload
 
 
 def build_market_change_summary(snapshot: Dict[str, Any]) -> Dict[str, str]:
@@ -3641,7 +3174,7 @@ def parse_performance_request_filters(source: Any) -> Dict[str, list[str]]:
             values = [item for item in values.split(",") if item]
         if values or group_is_active:
             filters[key] = list(values or [])
-    for key in ("start_date", "end_date"):
+    for key in ("expiration_start", "expiration_end"):
         value = str(source.get(key) or "").strip() if hasattr(source, "get") else ""
         if value:
             filters[key] = [value]
@@ -3656,12 +3189,12 @@ def normalize_requested_performance_filters(filters: Optional[Dict[str, list[str
         allowed = {normalize_filter_value(group, option) for option in options}
         values = [normalize_filter_value(group, value) for value in (filters.get(group) or [])]
         normalized[group] = [value for value in values if value in allowed]
-    for key in ("start_date", "end_date"):
+    for key in ("expiration_start", "expiration_end"):
         if not filters or key not in filters:
             continue
-        raw_value = str((filters.get(key) or [""])[0] or "").strip()
-        if raw_value:
-            normalized[key] = [raw_value]
+        value = str((filters.get(key) or [""])[0] or "").strip()
+        if value:
+            normalized[key] = [value]
     return normalized
 
 
@@ -3675,6 +3208,9 @@ def build_mobile_performance_ui_filters(filters: Optional[Dict[str, list[str]]] 
         default_values = list(PERFORMANCE_DEFAULT_FILTERS.get(group, ()))
         if default_values:
             ui_filters[group] = default_values
+    for key in ("expiration_start", "expiration_end"):
+        if key in requested:
+            ui_filters[key] = list(requested.get(key) or [])
     return ui_filters
 
 
@@ -3687,12 +3223,12 @@ def build_hosted_performance_query_string(filters: Optional[Dict[str, list[str]]
         query_parts.append((f"{group}__active", "1"))
         for value in values:
             query_parts.append((group, value))
-    for key in ("start_date", "end_date"):
+    for key in ("expiration_start", "expiration_end"):
         if not filters or key not in filters:
             continue
-        raw_value = str((filters.get(key) or [""])[0] or "").strip()
-        if raw_value:
-            query_parts.append((key, raw_value))
+        value = str((filters.get(key) or [""])[0] or "").strip()
+        if value:
+            query_parts.append((key, value))
     return urllib.parse.urlencode(query_parts, doseq=True)
 
 
@@ -3948,82 +3484,6 @@ def _clear_hosted_payload_cache(*prefixes: str, app: Optional[Flask] = None) -> 
             cache.pop(cache_key, None)
 
 
-def _resolve_trade_number(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _execute_supabase_refresh(app: Optional[Flask] = None) -> None:
-    """Clear the payload cache and force a fresh read from Supabase, then set a status message."""
-    _clear_hosted_payload_cache(app=app)
-    trade_store = get_trade_store(app)
-    all_trades = trade_store.list_trades("real") + trade_store.list_trades("simulated")
-    journal_count = len(all_trades)
-    max_trade_number = max((_resolve_trade_number(t.get("trade_number")) for t in all_trades), default=0)
-    active_states = get_open_trade_manager(app).state_repository.load_management_states()
-    active_count = len(active_states)
-    set_status_message(
-        f"Refreshed from Supabase: {journal_count} journal row(s) loaded, "
-        f"max trade # {max_trade_number}, {active_count} active_trades row(s).",
-        level="info",
-    )
-
-
-def resolve_post_schwab_redirect_target(*, app: Optional[Flask] = None) -> str:
-    container = _resolve_flask_container(app)
-    if str(container.config.get("RUNTIME_TARGET") or "").strip().lower() != "hosted":
-        return url_for("index") if has_request_context() else "/"
-    default_target = url_for("hosted_shell_home") if has_request_context() else "/hosted"
-    requested_next = str(request.args.get("next") or "").strip() if has_request_context() else ""
-    if requested_next:
-        return sanitize_hosted_next_path(requested_next)
-    referrer = str(request.referrer or "").strip() if has_request_context() else ""
-    if referrer:
-        parsed = urllib.parse.urlsplit(referrer)
-        candidate = parsed.path or default_target
-        if parsed.query:
-            candidate = f"{candidate}?{parsed.query}"
-        return sanitize_hosted_next_path(candidate)
-    return default_target
-
-
-def refresh_from_supabase_truth(*, app: Optional[Flask] = None) -> Dict[str, Any]:
-    container = _resolve_flask_container(app)
-    _clear_hosted_payload_cache(app=container)
-
-    trade_store = get_trade_store(container)
-    loaded_trade_count = 0
-    max_trade_number = 0
-    for trade_mode in ("real", "simulated", "talos"):
-        for trade in trade_store.list_trades(trade_mode):
-            loaded_trade_count += 1
-            max_trade_number = max(max_trade_number, int(trade.get("trade_number") or 0))
-
-    management_payload = build_hosted_open_trade_management_payload(app=container)
-    active_trades_count = int(management_payload.get("open_trade_count") or 0)
-
-    performance_service = get_performance_service(container)
-    load_records = getattr(performance_service, "load_records", None)
-    performance_record_count = len(load_records()) if callable(load_records) else 0
-
-    diagnostics = {
-        "loaded_trade_count": loaded_trade_count,
-        "max_trade_number": max_trade_number,
-        "active_trades_count": active_trades_count,
-        "performance_record_count": performance_record_count,
-    }
-    container.logger.info(
-        "Hosted Supabase truth refresh | loaded_trade_count=%s | performance_record_count=%s | max_trade_number=%s | active_trades_count=%s",
-        diagnostics["loaded_trade_count"],
-        diagnostics["performance_record_count"],
-        diagnostics["max_trade_number"],
-        diagnostics["active_trades_count"],
-    )
-    return diagnostics
-
-
 def get_workflow_state(app: Optional[Flask] = None) -> WorkflowStateStore:
     container = app or current_app
     workflow_state = container.extensions.get("workflow_state")
@@ -4036,214 +3496,6 @@ def get_workflow_state(app: Optional[Flask] = None) -> WorkflowStateStore:
         )
         container.extensions["workflow_state"] = workflow_state
     return workflow_state
-
-
-HOSTED_UNIFIED_PUBLIC_ENDPOINTS = {
-    "static",
-    "login",
-    "callback",
-    "unified_private_access_check",
-    "unified_sign_in",
-    "unified_sign_out",
-}
-
-
-def request_requires_json_auth_response() -> bool:
-    endpoint = str(request.endpoint or "").strip()
-    if request.path.startswith("/api/") or request.path == "/performance/data":
-        return True
-    if endpoint.startswith("kairos_") and endpoint not in {"kairos_placeholder", "kairos_live_page", "kairos_sim_page"}:
-        return True
-    preferred = request.accept_mimetypes.best_match(["application/json", "text/html"])
-    if preferred != "application/json":
-        return False
-    return request.accept_mimetypes["application/json"] > request.accept_mimetypes["text/html"]
-
-
-def build_unified_browser_next_path() -> str:
-    full_path = str(request.full_path or request.path or url_for("index")).strip()
-    return sanitize_unified_next_path(full_path)
-
-
-def build_unified_sign_in_url(*, next_path: Any = None) -> str:
-    sanitized_next = sanitize_unified_next_path(next_path)
-    default_home = url_for("index") if has_request_context() else "/"
-    if sanitized_next == default_home:
-        return url_for("unified_sign_in") if has_request_context() else "/sign-in"
-    if has_request_context():
-        return url_for("unified_sign_in", next=sanitized_next)
-    return f"/sign-in?{urllib.parse.urlencode({'next': sanitized_next})}"
-
-
-def _request_arg_values(request_args: Any, key: str) -> list[str]:
-    getlist = getattr(request_args, "getlist", None)
-    if callable(getlist):
-        return [str(item) for item in getlist(key)]
-    raw_value = request_args.get(key) if hasattr(request_args, "get") else None
-    if isinstance(raw_value, list):
-        return [str(item) for item in raw_value]
-    return [str(raw_value)] if raw_value not in {None, ""} else []
-
-
-def _append_query_string(path: str, request_args: Any, *, overrides: Optional[Dict[str, Any]] = None, exclude: tuple[str, ...] = ()) -> str:
-    params: list[tuple[str, str]] = []
-    if hasattr(request_args, "keys"):
-        for key in request_args.keys():
-            if key in exclude:
-                continue
-            for value in _request_arg_values(request_args, key):
-                params.append((str(key), value))
-    for key, value in (overrides or {}).items():
-        if value in {None, ""}:
-            continue
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                params.append((str(key), str(item)))
-        else:
-            params.append((str(key), str(value)))
-    if not params:
-        return path
-    return f"{path}?{urllib.parse.urlencode(params, doseq=True)}"
-
-
-def map_legacy_hosted_kairos_action_path(workspace: str, action_path: str) -> str:
-    normalized_workspace = "sim" if str(workspace or "").strip().lower() == "sim" else "live"
-    normalized_action = str(action_path or "").strip().strip("/").lower()
-    action_map = {
-        "status": f"/kairos/{normalized_workspace}/status",
-        "activate": f"/kairos/{normalized_workspace}/activate",
-        "configure": f"/kairos/{normalized_workspace}/configure",
-        "stop": f"/kairos/{normalized_workspace}/stop",
-        "runner/start": f"/kairos/{normalized_workspace}/runner/start",
-        "runner/pause": f"/kairos/{normalized_workspace}/runner/pause",
-        "runner/resume": f"/kairos/{normalized_workspace}/runner/resume",
-        "runner/restart": f"/kairos/{normalized_workspace}/runner/restart",
-        "runner/candidate/select": f"/kairos/{normalized_workspace}/runner/candidate/select",
-        "runner/candidate/take": f"/kairos/{normalized_workspace}/runner/candidate/take",
-        "runner/candidate/ignore": f"/kairos/{normalized_workspace}/runner/candidate/ignore",
-        "best-trade": "/kairos/live/best-trade" if normalized_workspace == "live" else "/kairos/sim/runner/best-trade",
-        "trade/open": "/kairos/live/trade/open",
-        "trade/exit/accept": "/kairos/live/trade/exit/accept",
-        "trade/exit/skip": "/kairos/live/trade/exit/skip",
-        "replay/import": "/kairos/sim/replay/import",
-        "runner/exit/accept": "/kairos/sim/runner/exit/accept",
-        "runner/exit/skip": "/kairos/sim/runner/exit/skip",
-        "runner/end": f"/kairos/{normalized_workspace}/runner/end",
-    }
-    return action_map.get(normalized_action, "/kairos/live")
-
-
-def map_legacy_hosted_request_to_unified_path(source_request: Any) -> str:
-    path = str(getattr(source_request, "path", "") or "").strip() or "/hosted"
-    args = getattr(source_request, "args", {})
-
-    if path in {"/hosted", "/hosted/"}:
-        return "/"
-    if path == "/hosted/research":
-        return _append_query_string("/research", args)
-    if path == "/hosted/private-access-check":
-        return "/private-access-check"
-    if path in {"/hosted/sign-out", "/hosted/logout"}:
-        return "/sign-out"
-    if path.startswith("/hosted/login"):
-        next_values = _request_arg_values(args, "next")
-        next_path = sanitize_unified_next_path(next_values[0] if next_values else "/")
-        return _append_query_string("/sign-in", args, overrides={"next": next_path}, exclude=("next", "view"))
-    if path == "/hosted/launch":
-        next_values = _request_arg_values(args, "next")
-        if next_values:
-            return sanitize_unified_next_path(next_values[0])
-        return "/"
-    if path in {"/hosted/mobile", "/hosted/mobile/trades", "/hosted/mobile/more"}:
-        return "/"
-    if path in {"/hosted/mobile/apollo", "/hosted/mobile/runs"}:
-        return "/apollo?autorun=1"
-    if path == "/hosted/mobile/kairos":
-        return "/kairos/live"
-    if path == "/hosted/mobile/performance":
-        return _append_query_string("/performance", args)
-    if path in {"/hosted/mobile/journal", "/hosted/mobile/journal/create"}:
-        return "/trades/real"
-    if path.startswith("/hosted/mobile/run/"):
-        engine = path.rsplit("/", 1)[-1].strip().lower()
-        return "/apollo?autorun=1" if engine == "apollo" else "/kairos/live"
-    if path == "/hosted/actions/open-trades":
-        return "/management/open-trades"
-    if path == "/hosted/actions/performance-summary":
-        return _append_query_string("/performance-summary", args)
-    if path == "/hosted/performance/data":
-        return _append_query_string("/performance/data", args)
-    if path in {"/hosted/actions/apollo", "/hosted/actions/apollo/run", "/hosted/apollo"}:
-        return _append_query_string("/apollo", args)
-    if path in {"/hosted/actions/kairos", "/hosted/actions/kairos/run", "/hosted/kairos", "/hosted/kairos/live"}:
-        return "/kairos/live"
-    if path == "/hosted/kairos/sim":
-        return "/kairos/sim"
-    if path.startswith("/hosted/actions/kairos-workspace/"):
-        parts = path.split("/", 5)
-        workspace = parts[4] if len(parts) > 4 else "live"
-        action_path = parts[5] if len(parts) > 5 else "status"
-        return map_legacy_hosted_kairos_action_path(workspace, action_path)
-    if path == "/hosted/performance":
-        return _append_query_string("/performance", args)
-    if path == "/hosted/journal":
-        trade_mode_values = _request_arg_values(args, "trade_mode")
-        trade_mode = resolve_trade_mode(trade_mode_values[0] if trade_mode_values else "real")
-        return _append_query_string(f"/trades/{trade_mode}", args, exclude=("trade_mode",))
-    if path.startswith("/hosted/journal/") and path.endswith("/edit"):
-        parts = path.split("/")
-        if len(parts) >= 6:
-            return f"/trades/{parts[3]}/{parts[4]}/edit"
-    if path.startswith("/hosted/journal/") and path.endswith("/delete"):
-        parts = path.split("/")
-        if len(parts) >= 6:
-            return f"/trades/{parts[3]}/{parts[4]}/delete"
-    if path in {"/hosted/open-trades", "/hosted/manage-trades"}:
-        return _append_query_string("/management/open-trades", args)
-    if path == "/hosted/notifications":
-        return "/notifications"
-    if path.startswith("/hosted/manage-trades/status-update/"):
-        trade_mode = path.rsplit("/", 1)[-1]
-        return f"/management/open-trades/status-update/{trade_mode}"
-    if path.startswith("/hosted/manage-trades/") and path.endswith("/prefill-close"):
-        trade_id = path.split("/")[-2]
-        return f"/management/open-trades/{trade_id}/prefill-close"
-    if path.startswith("/hosted/manage-trades/") and path.endswith("/notifications"):
-        trade_id = path.split("/")[-2]
-        return f"/management/open-trades/{trade_id}/notifications"
-    if path == "/hosted/apollo/prefill-candidate":
-        return "/apollo/prefill-candidate"
-    if path == "/hosted/kairos/prefill-candidate":
-        return "/kairos/prefill-candidate"
-    if path == "/hosted/dev/sync-delphi4":
-        return "/dev/sync-delphi4"
-    return "/"
-
-
-def sanitize_unified_next_path(value: Any) -> str:
-    candidate = str(value or "").strip()
-    default_home = url_for("index") if has_request_context() else "/"
-    if not candidate or candidate == "?":
-        return default_home
-    if candidate.endswith("?"):
-        candidate = candidate[:-1]
-    if candidate.startswith("//"):
-        return default_home
-    if candidate.startswith("/hosted"):
-        parsed = urllib.parse.urlsplit(candidate)
-        candidate = map_legacy_hosted_request_to_unified_path(
-            type(
-                "_LegacyHostedRequest",
-                (),
-                {
-                    "path": parsed.path,
-                    "args": urllib.parse.parse_qs(parsed.query, keep_blank_values=True),
-                },
-            )()
-        )
-    if not str(candidate).startswith("/"):
-        return default_home
-    return str(candidate)
 
 
 def authorize_hosted_private_action_request(app: Optional[Flask] = None) -> tuple[Optional[RequestIdentity], Optional[Any]]:
@@ -4259,12 +3511,7 @@ def authorize_hosted_private_browser_request(app: Optional[Flask] = None) -> tup
     try:
         return require_hosted_private_access(app), None
     except AuthenticationRequiredError:
-        return None, redirect(
-            build_hosted_login_url(
-                get_hosted_device_branch(default="desktop"),
-                next_path=build_hosted_browser_next_path(),
-            )
-        )
+        return None, redirect(build_hosted_launch_url(next_path=build_hosted_browser_next_path()))
     except PrivateAccessDeniedError as exc:
         return None, (
             render_template(
@@ -4444,7 +3691,6 @@ def render_hosted_journal_page(
         hosted_edit_enabled=True,
         hosted_delete_enabled=True,
         hosted_admin_error=admin_error,
-        supabase_refresh_url=url_for("hosted_journal_refresh_from_supabase"),
         **hosted_context,
         **build_hosted_template_context(identity, app=app),
     )
@@ -4566,7 +3812,6 @@ def build_hosted_shell_navigation() -> list[Dict[str, str]]:
 
 def build_delphi_route_map(*, hosted: bool = False) -> Dict[str, str]:
     if hosted:
-        hosted_next = sanitize_hosted_next_path(request.full_path or request.path) if has_request_context() else "/hosted"
         return {
             "home": url_for("hosted_shell_home"),
             "research": url_for("hosted_research"),
@@ -4581,8 +3826,6 @@ def build_delphi_route_map(*, hosted: bool = False) -> Dict[str, str]:
             "notifications": url_for("hosted_notifications_settings_page"),
             "performance_data": url_for("hosted_performance_data"),
             "text_status": url_for("text_status_api"),
-            "schwab_login": url_for("login", next=hosted_next),
-            "schwab_logout": url_for("hosted_schwab_logout"),
             "logout": url_for("hosted_browser_sign_out"),
         }
 
@@ -4591,13 +3834,11 @@ def build_delphi_route_map(*, hosted: bool = False) -> Dict[str, str]:
         "research": url_for("research"),
         "apollo": url_for("run_apollo", autorun=1),
         "kairos": url_for("kairos_live_page"),
-        "talos": url_for("talos_dashboard_page"),
         "management": url_for("open_trade_management_page"),
         "performance": url_for("performance_dashboard"),
         "journal": url_for("trade_dashboard", trade_mode="real"),
         "journal_real": url_for("trade_dashboard", trade_mode="real"),
         "journal_simulated": url_for("trade_dashboard", trade_mode="simulated"),
-        "journal_talos": url_for("trade_dashboard", trade_mode="talos"),
         "open_trades": url_for("open_trade_management_page"),
         "notifications": url_for("notifications_settings_page"),
         "performance_data": url_for("performance_dashboard_data"),
@@ -4635,16 +3876,13 @@ def build_hosted_login_url(branch: Any, *, next_path: Any = None) -> str:
     active_branch = resolve_hosted_device_branch(branch)
     sanitized_next = sanitize_hosted_next_path(next_path)
     default_home = url_for("hosted_shell_home") if has_request_context() else "/hosted"
-    route_params: Dict[str, Any] = {}
-    if active_branch != "desktop":
-        route_params["view"] = active_branch
-    if sanitized_next != default_home:
-        route_params["next"] = sanitized_next
-    if has_request_context():
-        return url_for("hosted_login_entry", **route_params)
-    if not route_params:
-        return "/hosted/login"
-    return f"/hosted/login?{urllib.parse.urlencode(route_params)}"
+    if sanitized_next == default_home:
+        return url_for("hosted_branch_login", branch=active_branch) if has_request_context() else f"/hosted/login/{active_branch}"
+    return (
+        url_for("hosted_branch_login", branch=active_branch, next=sanitized_next)
+        if has_request_context()
+        else f"/hosted/login/{active_branch}?next={sanitized_next}"
+    )
 
 
 def map_hosted_next_path_to_desktop_path(next_path: Any) -> str:
@@ -4716,11 +3954,12 @@ def render_hosted_login_page(
     error_message: str,
 ) -> Any:
     active_branch = resolve_hosted_device_branch(branch)
-    template_name = "hosted_login.html"
+    template_name = "hosted_login_mobile.html" if active_branch == "mobile" else "hosted_login.html"
+    app_identity = build_runtime_app_identity(current_app)
     return render_template(
         template_name,
-        page_browser_title=f"{HOSTED_APP_DISPLAY_NAME} Sign In",
-        page_heading=f"{HOSTED_APP_DISPLAY_NAME} Sign In",
+        page_browser_title=f"{app_identity['display_name']} Sign In",
+        page_heading=f"{app_identity['display_name']} Sign In",
         page_copy="Structured market intelligence for disciplined options execution.",
         next_path=sanitize_hosted_next_path(next_path),
         form_email=form_email,
@@ -5018,43 +4257,19 @@ def build_hosted_template_context(
     extra_status_items: Optional[list[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     routes = build_delphi_route_map(hosted=True)
+    runtime_identity = build_runtime_app_identity(app)
     return {
         "hosted_mode": True,
         "hosted_identity": identity,
         "hosted_sign_out_url": routes["logout"],
         "delphi_routes": routes,
+        "app_identity": {
+            "display_name": HOSTED_APP_DISPLAY_NAME,
+            "page_kicker": HOSTED_APP_DISPLAY_NAME,
+            "version_label": f"Version {HOSTED_APP_VERSION}",
+            "session_cookie_name": runtime_identity["session_cookie_name"],
+        },
         "header_status_items": build_hosted_header_status_items(identity, app=app, extra_items=extra_status_items),
-    }
-
-
-def build_hosted_delphi4_sync_panel_context(
-    identity: RequestIdentity,
-    *,
-    app: Optional[Flask] = None,
-) -> Dict[str, Any] | None:
-    if not is_hosted_local_dev_request():
-        return None
-    sync_result = pop_hosted_delphi4_sync_result()
-    last_successful_sync_at = load_last_successful_sync_timestamp(get_hosted_delphi4_sync_status_repository(app))
-    source_summary = None
-    source_warning = None
-    try:
-        source_paths = resolve_delphi4_source_paths()
-        source_summary = {
-            "source_root": str(source_paths.source_root),
-            "trade_database_path": str(source_paths.trade_database_path),
-            "kairos_replay_dir": str(source_paths.kairos_replay_dir),
-        }
-    except FileNotFoundError as exc:
-        source_warning = str(exc)
-    return {
-        "visible": True,
-        "identity_label": identity.display_name or identity.email or "Hosted Debug",
-        "source_summary": source_summary,
-        "source_warning": source_warning,
-        "last_successful_sync_at": last_successful_sync_at,
-        "last_result": sync_result,
-        "action_url": url_for("hosted_delphi4_sync_action"),
     }
 
 
@@ -5349,6 +4564,24 @@ def clear_hosted_browser_session() -> None:
     session.pop(HOSTED_SESSION_DISPLAY_NAME_KEY, None)
 
 
+def mark_hosted_force_reauth() -> None:
+    if not has_request_context():
+        return
+    session[HOSTED_FORCE_REAUTH_SESSION_KEY] = True
+
+
+def clear_hosted_force_reauth() -> None:
+    if not has_request_context():
+        return
+    session.pop(HOSTED_FORCE_REAUTH_SESSION_KEY, None)
+
+
+def is_hosted_force_reauth_active() -> bool:
+    if not has_request_context():
+        return False
+    return bool(session.get(HOSTED_FORCE_REAUTH_SESSION_KEY))
+
+
 def resolve_hosted_browser_session_identity() -> RequestIdentity | None:
     if not has_request_context():
         return None
@@ -5411,6 +4644,8 @@ def resolve_hosted_browser_cache_identity(app: Optional[Flask] = None) -> Reques
 
 def resolve_local_hosted_debug_identity(app: Optional[Flask] = None) -> RequestIdentity | None:
     if not has_request_context():
+        return None
+    if is_hosted_force_reauth_active():
         return None
     host = str(request.host.split(":", 1)[0] or "").strip().lower()
     if host not in LOCAL_DEV_HOSTS:
@@ -5755,19 +4990,6 @@ def pop_status_message() -> Optional[Dict[str, str]]:
     return get_workflow_state().pop_status_message()
 
 
-def remember_hosted_delphi4_sync_result(payload: Dict[str, Any]) -> None:
-    if not has_request_context():
-        return
-    session[HOSTED_DELPHI4_SYNC_RESULT_KEY] = payload
-
-
-def pop_hosted_delphi4_sync_result() -> Optional[Dict[str, Any]]:
-    if not has_request_context():
-        return None
-    payload = session.pop(HOSTED_DELPHI4_SYNC_RESULT_KEY, None)
-    return payload if isinstance(payload, dict) else None
-
-
 def remember_hosted_mobile_apollo_handoff(payload: Dict[str, Any]) -> None:
     if not has_request_context():
         return
@@ -6093,7 +5315,10 @@ def build_trade_page_context(
     available_trade_modes: Optional[list[str] | tuple[str, ...]] = None,
 ) -> Dict[str, Any]:
     normalized_mode = resolve_trade_mode(trade_mode)
-    loaded_trades = store.list_trades(normalized_mode)
+    if normalized_mode == "talos":
+        normalized_mode = "simulated"
+    loaded_trade_modes = (normalized_mode,)
+    loaded_trades = [trade for trade_mode_key in loaded_trade_modes for trade in store.list_trades(trade_mode_key)]
     trades = [build_trade_row_payload(item) for item in loaded_trades]
     summary = summarize_loaded_trade_rows(loaded_trades)
     trade_record = editing_trade if editing_trade is not None else (store.get_trade(editing_trade_id) if editing_trade_id else None)
@@ -6123,7 +5348,7 @@ def build_trade_page_context(
                 "description": TRADE_MODE_DESCRIPTIONS.get(key, ""),
             }
             for key, label in TRADE_MODE_LABELS.items()
-            if available_trade_modes is None or key in available_trade_modes
+            if key in (available_trade_modes or PUBLIC_TRADE_MODES)
         ],
         "filter_groups": TRADE_FILTER_GROUPS,
         "system_name_options": list(TRADE_SYSTEM_OPTIONS),
@@ -6706,15 +5931,13 @@ def build_diagnostic_message(
 
 def execute_apollo_precheck(apollo_service: ApolloService, trigger_source: str, *, force_refresh: bool = False) -> Dict[str, Any]:
     """Run Apollo once and convert the result into a template-ready payload."""
-    apollo_data = apollo_service.run_precheck(force_refresh=force_refresh)
     payload = build_apollo_result_payload(
-        apollo_data,
+        apollo_service.run_precheck(force_refresh=force_refresh),
         trigger_source=trigger_source,
     )
     payload["execution_source_label"] = str(trigger_source or "unknown").title()
     payload["live_data_provider"] = apollo_service.market_data_service.get_provider_metadata().get("live_provider_name", "Unknown Provider")
     payload["live_data_mode"] = "Fresh live data" if force_refresh else "Live data"
-    payload["header_market_snapshots"] = dict(apollo_data.get("header_market_snapshots") or {})
     return payload
 
 
@@ -6722,7 +5945,7 @@ def get_apollo_trigger_source() -> Optional[str]:
     """Return the Apollo trigger source for the current request."""
     if request.method == "POST":
         return "button"
-    if str(request.args.get("autorun", "")).strip().lower() in {"1", "true", "yes", "on"}:
+    if is_local_dev_request() and str(request.args.get("autorun", "")).strip().lower() in {"1", "true", "yes", "on"}:
         return "autorun URL"
     return None
 

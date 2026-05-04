@@ -86,15 +86,18 @@
                     </fieldset>
                 {% endfor %}
             </div>
-            <div class="trade-import-grid" style="margin-top: 1rem;">
-                <div class="field-group">
-                    <label for="performance-start-date">Custom Start Date</label>
-                    <input id="performance-start-date" class="performance-date-input" type="date" value="{{ active_filters.get('start_date', '') }}">
-                </div>
-                <div class="field-group">
-                    <label for="performance-end-date">Custom End Date</label>
-                    <input id="performance-end-date" class="performance-date-input" type="date" value="{{ active_filters.get('end_date', '') }}">
-                </div>
+            {% set custom_start = (active_filters.get('expiration_start', [])|first)|default('', true) %}
+            {% set custom_end = (active_filters.get('expiration_end', [])|first)|default('', true) %}
+            <div class="performance-custom-date-range" id="performance-custom-date-range" {% if 'custom' not in active_filters.get('timeframe', []) %}hidden{% endif %}>
+                <label class="performance-custom-date-field">
+                    <span>Start Date</span>
+                    <input type="date" id="performance-expiration-start" value="{{ custom_start }}">
+                </label>
+                <label class="performance-custom-date-field">
+                    <span>End Date</span>
+                    <input type="date" id="performance-expiration-end" value="{{ custom_end }}">
+                </label>
+                <button type="button" class="button-link" id="performance-custom-apply">Apply</button>
             </div>
         </section>
 
@@ -130,7 +133,7 @@
 
         <section class="panel performance-learning-panel">
             <div class="performance-panel-header">
-                <h2>{% if hosted_mode %}Delphi 7.2.15 Hosted Learning Metrics{% else %}Performance Learning Metrics{% endif %}</h2>
+                <h2>{% if hosted_mode %}Delphi 8.0.7 Hosted Learning Metrics{% else %}Performance Learning Metrics{% endif %}</h2>
                 <span class="subtle">Decision-useful trade-quality analytics derived from current stored trade history, timestamps, close events, VIX, and EM metadata.</span>
             </div>
 
@@ -274,8 +277,10 @@
         const performanceUrl = performanceRoot?.dataset.performanceUrl;
         const payloadElement = document.getElementById('performance-dashboard-payload');
         const filterInputs = Array.from(document.querySelectorAll('.performance-filter-input'));
-        const dateInputs = Array.from(document.querySelectorAll('.performance-date-input'));
-        const customRangeInput = document.querySelector('.performance-timeframe-input[value="custom-range"]');
+        const customDateRange = document.getElementById('performance-custom-date-range');
+        const customStartInput = document.getElementById('performance-expiration-start');
+        const customEndInput = document.getElementById('performance-expiration-end');
+        const customApplyButton = document.getElementById('performance-custom-apply');
         const palette = {
             blue: '#1f6feb',
             blueSoft: '#d8e8ff',
@@ -501,27 +506,47 @@
                     filters[group].push(input.value);
                 }
             });
-            dateInputs.forEach((input) => {
-                if (input.value) {
-                    filters[input.id === 'performance-start-date' ? 'start_date' : 'end_date'] = input.value;
+            if (filters.timeframe?.includes('custom')) {
+                const expirationStart = customStartInput?.value || '';
+                const expirationEnd = customEndInput?.value || '';
+                if (expirationStart) {
+                    filters.expiration_start = [expirationStart];
                 }
-            });
+                if (expirationEnd) {
+                    filters.expiration_end = [expirationEnd];
+                }
+            }
             return filters;
         };
 
         const buildQuery = (filters) => {
             const params = new URLSearchParams();
             Object.entries(filters).forEach(([key, values]) => {
-                if (key === 'start_date' || key === 'end_date') {
-                    if (values) {
-                        params.append(key, values);
-                    }
+                const normalizedValues = Array.isArray(values)
+                    ? values.filter((value) => value !== undefined && value !== null && value !== '')
+                    : [values].filter((value) => value !== undefined && value !== null && value !== '');
+                if (!normalizedValues.length) {
                     return;
                 }
-                params.append(`${key}__active`, '1');
-                values.forEach((value) => params.append(key, value));
+                if (!['expiration_start', 'expiration_end'].includes(key)) {
+                    params.append(`${key}__active`, '1');
+                }
+                normalizedValues.forEach((value) => params.append(key, value));
             });
             return params.toString();
+        };
+
+        const isCustomTimeframeSelected = () => document.querySelector('.performance-timeframe-input:checked')?.value === 'custom';
+
+        const syncCustomDateRange = () => {
+            const customSelected = isCustomTimeframeSelected();
+            if (customDateRange) {
+                customDateRange.hidden = !customSelected;
+            }
+            if (customApplyButton) {
+                const hasValidRange = Boolean(customStartInput?.value) && Boolean(customEndInput?.value) && customStartInput.value <= customEndInput.value;
+                customApplyButton.disabled = customSelected && !hasValidRange;
+            }
         };
 
         const formatHostedLabel = (value) => String(value || '') === 'Subprime' ? 'SubPrime' : String(value || '');
@@ -1539,6 +1564,12 @@
             if (!performanceUrl) {
                 return;
             }
+            if (isCustomTimeframeSelected()) {
+                if (!customStartInput?.value || !customEndInput?.value || customStartInput.value > customEndInput.value) {
+                    syncCustomDateRange();
+                    return;
+                }
+            }
             if (pendingRequest) {
                 pendingRequest.abort();
             }
@@ -1563,19 +1594,22 @@
         };
 
         filterInputs.forEach((input) => {
-            input.addEventListener('change', refreshDashboard);
-        });
-
-        dateInputs.forEach((input) => {
             input.addEventListener('change', () => {
-                if (customRangeInput) {
-                    customRangeInput.checked = true;
+                syncCustomDateRange();
+                if (input.classList.contains('performance-timeframe-input') && input.value === 'custom' && input.checked) {
+                    return;
                 }
                 refreshDashboard();
             });
         });
 
+        customStartInput?.addEventListener('input', syncCustomDateRange);
+        customEndInput?.addEventListener('input', syncCustomDateRange);
+        customApplyButton?.addEventListener('click', refreshDashboard);
+
+        syncCustomDateRange();
         renderDashboard(latestDashboardPayload);
     </script>
 </body>
 </html>
+

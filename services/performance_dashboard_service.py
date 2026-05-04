@@ -31,10 +31,10 @@ PERFORMANCE_FILTER_GROUPS = {
     "system": ["Apollo", "Kairos", "Aegis"],
     "profile": ["Legacy", "Aggressive", "Fortress", "Standard", "Prime", "Subprime"],
     "result": ["Win", "Loss", "Black Swan", "Scratched"],
-    "trade_mode": ["Real", "Simulated", "Talos"],
+    "trade_mode": ["Real", "Simulated"],
     "macro_grade": ["None", "Minor", "Major"],
     "structure_grade": ["Good", "Neutral", "Poor"],
-    "timeframe": ["All", "YTD", "Last Month", "Last Qtr", "Current Month", "1 Yr", "Custom Range"],
+    "timeframe": ["All", "YTD", "Last Month", "Last Qtr", "Current Month", "1 Yr", "Custom"],
 }
 
 PERFORMANCE_DEFAULT_FILTERS = {
@@ -67,11 +67,11 @@ class PerformanceFilters:
     macro_grade: tuple[str, ...]
     structure_grade: tuple[str, ...]
     timeframe: tuple[str, ...]
-    start_date: str
-    end_date: str
+    expiration_start: str = ""
+    expiration_end: str = ""
 
-    def as_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+    def as_dict(self) -> Dict[str, list[str]]:
+        return {
             "system": list(self.system),
             "profile": list(self.profile),
             "result": list(self.result),
@@ -79,12 +79,9 @@ class PerformanceFilters:
             "macro_grade": list(self.macro_grade),
             "structure_grade": list(self.structure_grade),
             "timeframe": list(self.timeframe),
+            "expiration_start": [self.expiration_start] if self.expiration_start else [],
+            "expiration_end": [self.expiration_end] if self.expiration_end else [],
         }
-        if self.start_date:
-            payload["start_date"] = self.start_date
-        if self.end_date:
-            payload["end_date"] = self.end_date
-        return payload
 
 
 @dataclass(frozen=True)
@@ -132,7 +129,7 @@ class PerformanceDashboardService:
 
     def load_records(self) -> list[Dict[str, Any]]:
         records: list[Dict[str, Any]] = []
-        for trade_mode in ("real", "simulated", "talos"):
+        for trade_mode in ("real", "simulated"):
             for trade in self.store.list_trades(trade_mode):
                 records.append(build_performance_record(trade))
         return records
@@ -179,17 +176,17 @@ def normalize_performance_filters(filters: Optional[Dict[str, Iterable[str]]] = 
             continue
         default_values = tuple(value for value in PERFORMANCE_DEFAULT_FILTERS.get(key, ()) if value in allowed)
         normalized[key] = default_values or tuple(sorted(allowed))
-    start_date = str(next(iter(filters.get("start_date") or []), "") or "").strip()
-    end_date = str(next(iter(filters.get("end_date") or []), "") or "").strip()
-    return PerformanceFilters(**normalized, start_date=start_date, end_date=end_date)
+    return PerformanceFilters(
+        **normalized,
+        expiration_start=_normalize_date_filter_value(filters.get("expiration_start")),
+        expiration_end=_normalize_date_filter_value(filters.get("expiration_end")),
+    )
 
 
 def build_performance_record(trade: Dict[str, Any]) -> Dict[str, Any]:
     normalized_trade_mode = str(trade.get("trade_mode") or "").strip().lower()
     if normalized_trade_mode == "real":
         trade_mode = "Real"
-    elif normalized_trade_mode == "talos":
-        trade_mode = "Talos"
     else:
         trade_mode = "Simulated"
     profile = resolve_trade_candidate_profile(trade)
@@ -300,7 +297,6 @@ def build_performance_record(trade: Dict[str, Any]) -> Dict[str, Any]:
 
 def apply_performance_filters(records: list[Dict[str, Any]], filters: PerformanceFilters) -> list[Dict[str, Any]]:
     active = filters.as_dict()
-    timeframe_values = tuple(active.get("timeframe") or ["all"])
     reference_date = date.today()
     filtered: list[Dict[str, Any]] = []
     for record in records:
@@ -317,44 +313,43 @@ def apply_performance_filters(records: list[Dict[str, Any]], filters: Performanc
             continue
         if normalize_filter_value("structure_grade", record.get("structure_grade")) not in active["structure_grade"]:
             continue
-        if not record_matches_timeframe(
-            record,
-            timeframe_values,
-            reference_date=reference_date,
-            start_date=filters.start_date,
-            end_date=filters.end_date,
-        ):
+        if not record_matches_timeframe(record, filters=filters, reference_date=reference_date):
             continue
         filtered.append(record)
     return filtered
 
 
-def record_matches_timeframe(
-    record: Dict[str, Any],
-    timeframe_values: Iterable[str],
-    *,
-    reference_date: date,
-    start_date: str = "",
-    end_date: str = "",
-) -> bool:
-    selected = [str(value or "").strip().lower() for value in timeframe_values if str(value or "").strip()]
+def record_matches_timeframe(record: Dict[str, Any], *, filters: PerformanceFilters, reference_date: date) -> bool:
+    selected = [str(value or "").strip().lower() for value in filters.timeframe if str(value or "").strip()]
     if not selected or "all" in selected:
         return True
-    trade_date = parse_trade_date(record.get("expiration_date")) or parse_trade_date(record.get("trade_date"))
+    if "custom" in selected:
+        expiration_date = parse_trade_date(record.get("expiration_date")) or parse_trade_date(record.get("trade_date"))
+        if expiration_date is None:
+            return False
+        start_date = parse_trade_date(filters.expiration_start)
+        end_date = parse_trade_date(filters.expiration_end)
+        if start_date is not None and expiration_date < start_date:
+            return False
+        if end_date is not None and expiration_date > end_date:
+            return False
+        return True
+    trade_date = parse_trade_date(record.get("trade_date"))
     if trade_date is None:
         return False
-    start_bound = parse_trade_date(start_date)
-    end_bound = parse_trade_date(end_date)
-    return any(
-        _date_in_timeframe(
-            trade_date,
-            timeframe_key=value,
-            reference_date=reference_date,
-            start_date=start_bound,
-            end_date=end_bound,
-        )
-        for value in selected
-    )
+    return any(_date_in_timeframe(trade_date, timeframe_key=value, reference_date=reference_date) for value in selected)
+
+
+def _normalize_date_filter_value(value: Iterable[str] | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return parse_trade_date(value).isoformat() if parse_trade_date(value) is not None else ""
+    for item in value:
+        normalized = _normalize_date_filter_value(str(item or "").strip())
+        if normalized:
+            return normalized
+    return ""
 
 
 def parse_trade_date(value: Any) -> date | None:
@@ -371,14 +366,7 @@ def parse_trade_date(value: Any) -> date | None:
         return None
 
 
-def _date_in_timeframe(
-    trade_date: date,
-    *,
-    timeframe_key: str,
-    reference_date: date,
-    start_date: date | None = None,
-    end_date: date | None = None,
-) -> bool:
+def _date_in_timeframe(trade_date: date, *, timeframe_key: str, reference_date: date) -> bool:
     normalized = str(timeframe_key or "all").strip().lower()
     if normalized == "all":
         return True
@@ -403,12 +391,6 @@ def _date_in_timeframe(
         start_month = ((quarter - 1) * 3) + 1
         end_month = start_month + 2
         return trade_date.year == year and start_month <= trade_date.month <= end_month
-    if normalized == "custom-range":
-        if start_date is not None and trade_date < start_date:
-            return False
-        if end_date is not None and trade_date > end_date:
-            return False
-        return True
     return True
 
 

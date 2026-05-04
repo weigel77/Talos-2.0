@@ -3,68 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ page_browser_title }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
-</head>
-<body>
-    <main class="page-shell">
-        <section class="hero-card delphi-header-card delphi-shared-header delphi-header-card-subpage">
-            <div class="delphi-header-content">
-                <div class="delphi-header-top">
-                    <div class="delphi-header-brand">
-                        <div>
-                            <p class="hero-kicker delphi-header-kicker">Delphi 7.2.15 Hosted</p>
-                            <h1>{{ page_heading }}</h1>
-                            <p class="hero-copy delphi-header-copy">{{ page_copy }}</p>
-                        </div>
-                    </div>
-                    <div class="delphi-header-meta">
-                        <span class="hero-version">Version 7.2.15</span>
-                        <p class="subtle">Hosted startup gate for Delphi private access.</p>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <section class="panel trade-dashboard-panel">
-            <div class="result-header">
-                <div>
-                    <h2>Hosted Access</h2>
-                    <p class="subtle">Sign in with the approved hosted email before starting Schwab authentication. Approved access is currently limited to beigel77@gmail.com.</p>
-                </div>
-            </div>
-
-            {% if error_message %}
-                <div class="message message-error">{{ error_message }}</div>
-            {% endif %}
-
-            <form method="post" action="{{ login_action_url or url_for('hosted_login_entry') }}" class="trade-import-form">
-                <input type="hidden" name="next" value="{{ next_path }}">
-                <div class="trade-import-grid">
-                    <div class="field-group">
-                        <label for="hosted-email">Hosted Email</label>
-                        <input id="hosted-email" name="email" type="email" autocomplete="email" value="{{ form_email }}" required>
-                    </div>
-                    <div class="field-group">
-                        <label for="hosted-password">Password</label>
-                        <input id="hosted-password" name="password" type="password" autocomplete="current-password" required>
-                    </div>
-                </div>
-                <div class="actions trade-form-actions">
-                    <button type="submit">Continue to Hosted Delphi</button>
-                    {% if alternate_login_url %}
-                    <a class="button-link button-link-secondary" href="{{ alternate_login_url }}">Switch to {{ alternate_branch|title }}</a>
-                    {% endif %}
-                </div>
-            </form>
-        </section>
-    </main>
-</body>
-</html><!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ page_browser_title }} | {{ app_identity.display_name }}</title>
     <style>
         :root {

@@ -44,6 +44,7 @@ class FileSystemKairosScenarioRepository:
 
     def __init__(self, repository: KairosScenarioRepository) -> None:
         self._repository = repository
+        self.write_count: int = 0
 
     def ensure_storage_dir(self) -> Path:
         return self._repository.ensure_storage_dir()
@@ -56,6 +57,7 @@ class FileSystemKairosScenarioRepository:
 
     def save_bundle(self, scenario_key: str, payload: Dict[str, Any]) -> bool:
         self._repository.save_bundle(scenario_key, payload)
+        self.write_count += 1
         return True
 
     def load_bundle_payloads(self) -> List[Tuple[Path, Dict[str, Any]]]:

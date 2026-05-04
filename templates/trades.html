@@ -18,7 +18,7 @@
                 active_page='journal',
                 page_heading=trade_mode_label,
                 page_copy=trade_mode_description,
-                page_meta='Persistent trade log for real, simulated, and Talos credit spreads.',
+                page_meta='Persistent trade log for real and simulated credit spreads backed by the shared Delphi journal.',
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
                 menu_status=menu_status,
@@ -41,12 +41,6 @@
                 {% if not hosted_read_only or hosted_prefill_enabled %}
                     <a class="button-link button-link-secondary" href="{% if hosted_read_only %}{{ url_for('hosted_shell_journal', trade_mode=trade_mode, _anchor='trade-entry-form') }}{% else %}{{ url_for('trade_dashboard', trade_mode=trade_mode, _anchor='trade-entry-form') }}{% endif %}">{% if hosted_read_only %}Jump to Draft Form{% else %}Jump to Manual Entry Form{% endif %}</a>
                 {% endif %}
-                {% if supabase_refresh_url is defined and supabase_refresh_url %}
-                    <form method="post" action="{{ supabase_refresh_url }}">
-                        <input type="hidden" name="trade_mode" value="{{ trade_mode }}">
-                        <button type="submit" class="secondary">Refresh from Supabase Truth</button>
-                    </form>
-                {% endif %}
             </div>
         </section>
 
@@ -54,7 +48,7 @@
             <div class="result-header">
                 <div>
                     <h2>{{ trade_mode_label }}</h2>
-                    <p class="subtle">{% if hosted_read_only %}{% if allow_trade_edit %}Hosted Delphi 7.2.11 journal mirrors the live Supabase trade store and supports draft review, editing, and deleting directly in hosted mode.{% else %}Hosted Delphi 7.2.11 journal mirrors the live trade store in read-only mode so links stay working and the browser surface stays safe.{% endif %}{% else %}One local database stores real, simulated, and Talos trades, filtered by mode.{% endif %}</p>
+                    <p class="subtle">{% if hosted_read_only %}{% if allow_trade_edit %}Hosted Delphi 8.0.7 journal mirrors the live Supabase trade store and supports draft review, editing, and deleting directly in hosted mode.{% else %}Hosted Delphi 8.0.7 journal mirrors the live trade store in read-only mode so links stay working and the browser surface stays safe.{% endif %}{% else %}One local database stores real and simulated trades for the shared Delphi workflow.{% endif %}</p>
                 </div>
             </div>
 
@@ -978,3 +972,4 @@
     </script>
 </body>
 </html>
+

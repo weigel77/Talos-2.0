@@ -2,17 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask
-
-from app import APP_CONFIG, create_app, get_runtime_app_config, resolve_runtime_app_config
-from config import HOSTED_PRODUCTION_CALLBACK_URL
+from app import create_app, get_runtime_app_config
 from services.runtime.hosted_auth import HostedAuthConfig, SupabaseHostedIdentityResolver, SupabasePrivateAccessGate, SupabaseSessionInvalidator
 from services.runtime.private_access import AuthenticationRequiredError, PrivateAccessDeniedError, RequestIdentity
 from services.repositories.hosted_runtime_state_repository import SupabaseTokenRepository
-from services.schwab_auth_service import SchwabAuthService
 
 
 class _AuthResponse:
@@ -31,45 +26,6 @@ class _AuthResponse:
 
 
 class HostedAuthTest(unittest.TestCase):
-    def test_hosted_production_authorize_url_uses_eigeltrade_callback_only(self):
-        app = Flask(__name__)
-        app.config.update(
-            {
-                "RUNTIME_TARGET": "hosted",
-                "HOSTED_PUBLIC_BASE_URL": "https://eigeltrade.com",
-                "SCHWAB_REDIRECT_URI": "https://127.0.0.1:5015/callback",
-                "SCHWAB_CLIENT_ID": "client-id",
-                "SCHWAB_CLIENT_SECRET": "client-secret",
-            }
-        )
-
-        with patch.dict("os.environ", {"DELPHI_DEPLOYMENT_ENV": "production"}, clear=False):
-            runtime_config = resolve_runtime_app_config(app, APP_CONFIG)
-        authorization_url = SchwabAuthService(runtime_config).build_authorization_url("state-123")
-        parsed = urlparse(authorization_url)
-        params = parse_qs(parsed.query)
-        redirect_uri = params["redirect_uri"][0]
-
-        self.assertEqual(redirect_uri, HOSTED_PRODUCTION_CALLBACK_URL)
-        self.assertNotIn("localhost", redirect_uri.lower())
-        self.assertNotIn("127.0.0.1", redirect_uri)
-        self.assertNotIn(":5000", redirect_uri)
-        self.assertNotIn(":5001", redirect_uri)
-        self.assertNotIn(":5015", redirect_uri)
-
-    def test_hosted_production_rejects_non_eigeltrade_public_base_url(self):
-        app = Flask(__name__)
-        app.config.update(
-            {
-                "RUNTIME_TARGET": "hosted",
-                "HOSTED_PUBLIC_BASE_URL": "https://127.0.0.1:5015",
-            }
-        )
-
-        with patch.dict("os.environ", {"DELPHI_DEPLOYMENT_ENV": "production"}, clear=False):
-            with self.assertRaisesRegex(RuntimeError, "HOSTED_PUBLIC_BASE_URL=https://eigeltrade.com"):
-                resolve_runtime_app_config(app, APP_CONFIG)
-
     def test_supabase_identity_resolver_reads_authenticated_user_from_bearer_token(self):
         app = create_app(
             {
@@ -211,7 +167,7 @@ class HostedAuthTest(unittest.TestCase):
             runtime_config = get_runtime_app_config(app)
             provider = app.extensions["market_data_service"].provider
 
-            self.assertEqual(runtime_config.schwab_redirect_uri, "https://eigeltrade.com/callback")
+            self.assertEqual(runtime_config.schwab_redirect_uri, "https://delphi-hosted.example.com/callback")
             self.assertEqual(runtime_config.schwab_token_path, "supabase://hosted_runtime_state/schwab_oauth_token/default")
             self.assertIsInstance(provider.auth_service.token_store, SupabaseTokenRepository)
             self.assertEqual(provider.auth_service.config.schwab_redirect_uri, runtime_config.schwab_redirect_uri)
@@ -224,7 +180,4 @@ class HostedAuthTest(unittest.TestCase):
             params = parse_qs(parsed.query)
             self.assertEqual(parsed.scheme, "https")
             self.assertEqual(parsed.netloc, "api.schwabapi.com")
-            self.assertEqual(params["redirect_uri"], ["https://eigeltrade.com/callback"])
-            self.assertNotIn("127.0.0.1", location)
-            self.assertNotIn("localhost", location)
-            self.assertNotIn(":5001", location)
+            self.assertEqual(params["redirect_uri"], ["https://delphi-hosted.example.com/callback"])
