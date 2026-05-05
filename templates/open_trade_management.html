@@ -15,8 +15,8 @@
             {{ render_delphi_header(
                 active_page='management',
                 page_heading='Open Trade Management',
-                page_copy='Live management board for open Apollo and Kairos positions with controlled Pushover escalation.',
-                page_meta='Live open-trade management for Apollo and Kairos positions.',
+                page_copy='Live management board for open Apollo and Talos positions with controlled Pushover escalation.',
+                page_meta='Live open-trade management for retained Apollo and Talos positions.',
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
                 menu_status=menu_status,
@@ -35,7 +35,7 @@
             <div class="result-header">
                 <div>
                     <h2>Management Engine</h2>
-                    <p class="subtle">{% if hosted_mode %}Hosted Delphi 8.0.7 pulls the same live open-trade evaluation data into a Supabase-backed board with the same send-to-close controls used on the local workflow. Global alert preferences now live in the header Notifications panel.{% else %}Real open trades are evaluated for morning snapshot, status change, action, and end-of-day Pushover notifications. Simulated open trades remain visible on this board for management review, and manual status updates stay limited to real and simulated positions. Global alert preferences now live in the header Notifications panel.{% endif %}</p>
+                    <p class="subtle">{% if hosted_mode %}Hosted Talos 2.0.1 pulls the same live open-trade evaluation data into a Supabase-backed board with the same send-to-close controls used on the local workflow. Global alert preferences now live in the header Notifications panel.{% else %}Real open trades are evaluated for morning snapshot, status change, action, and end-of-day Pushover notifications. Simulated open trades remain visible on this board for management review, and manual status updates stay limited to real and simulated positions. Global alert preferences now live in the header Notifications panel.{% endif %}</p>
                 </div>
                 {% if management_actions_enabled %}
                     <div class="actions trade-actions">
@@ -86,7 +86,7 @@
                 <div>
                     <h2>Open Positions</h2>
                     {% if not suppress_open_positions_copy %}
-                        <p class="subtle">{% if hosted_mode %}Statuses and action recommendations use the current live option-chain expected move. Hosted Delphi 8.0.7 alert delivery only applies to real trades, but both real and simulated open positions are listed here.{% else %}Statuses and action recommendations use the current live option-chain expected move. Delphi 8.0.7 local alert delivery only applies to real trades, while real and simulated open positions are listed here.{% endif %}</p>
+                        <p class="subtle">{% if hosted_mode %}Statuses and action recommendations use the current live option-chain expected move. Hosted Talos 2.0.1 alert delivery only applies to real trades, but both real and simulated open positions are listed here.{% else %}Statuses and action recommendations use the current live option-chain expected move. Talos 2.0.1 local alert delivery only applies to real trades, while real and simulated open positions are listed here.{% endif %}</p>
                     {% endif %}
                 </div>
             </div>

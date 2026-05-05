@@ -19,7 +19,7 @@ from .trade_store import (
     expected_move_learning_weight,
     normalize_expected_move_source,
     parse_datetime_value,
-    normalize_system_name,
+    resolve_trade_system_name,
     resolve_trade_candidate_profile,
     resolve_trade_credit_model,
     resolve_trade_distance,
@@ -28,7 +28,7 @@ from .trade_store import (
 from .em_policy_engine import build_em_policy_payload
 
 PERFORMANCE_FILTER_GROUPS = {
-    "system": ["Apollo", "Kairos", "Aegis"],
+    "system": ["Apollo", "Talos"],
     "profile": ["Legacy", "Aggressive", "Fortress", "Standard", "Prime", "Subprime"],
     "result": ["Win", "Loss", "Black Swan", "Scratched"],
     "trade_mode": ["Real", "Simulated"],
@@ -38,7 +38,7 @@ PERFORMANCE_FILTER_GROUPS = {
 }
 
 PERFORMANCE_DEFAULT_FILTERS = {
-    "trade_mode": ("real",),
+    "trade_mode": ("real", "simulated"),
     "timeframe": ("all",),
 }
 
@@ -129,9 +129,11 @@ class PerformanceDashboardService:
 
     def load_records(self) -> list[Dict[str, Any]]:
         records: list[Dict[str, Any]] = []
-        for trade_mode in ("real", "simulated"):
+        for trade_mode in ("real", "simulated", "talos"):
             for trade in self.store.list_trades(trade_mode):
-                records.append(build_performance_record(trade))
+                record = build_performance_record(trade)
+                if record.get("system") in {"Apollo", "Talos"}:
+                    records.append(record)
         return records
 
 
@@ -190,7 +192,7 @@ def build_performance_record(trade: Dict[str, Any]) -> Dict[str, Any]:
     else:
         trade_mode = "Simulated"
     profile = resolve_trade_candidate_profile(trade)
-    system = normalize_system_name(trade.get("system_name"))
+    system = resolve_trade_system_name(trade)
     result = classify_trade_result(trade)
     gross_pnl = coerce_float(trade.get("gross_pnl") if trade.get("gross_pnl") is not None else trade.get("pnl"))
     trade_date = pick_performance_date(trade)

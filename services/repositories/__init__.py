@@ -2,7 +2,6 @@
 
 from .apollo_snapshot_repository import ApolloSnapshotRepository, JsonFileApolloSnapshotRepository
 from .import_preview_repository import FileSystemImportPreviewRepository, ImportPreviewRepository
-from .kairos_snapshot_repository import JsonFileKairosSnapshotRepository, KairosSnapshotRepository, SupabaseKairosSnapshotRepository
 from .management_state_repository import (
     ACTIVE_TRADE_ALERT_LOG_TABLE,
     ACTIVE_TRADES_TABLE,
@@ -13,7 +12,6 @@ from .management_state_repository import (
     SupabaseOpenTradeManagementStateRepository,
     SQLiteOpenTradeManagementStateRepository,
 )
-from .scenario_repository import FileSystemKairosScenarioRepository, KairosBundleRepository, SupabaseKairosScenarioRepository
 from .token_repository import JsonFileTokenRepository, TokenRepository
 from .trade_repository import SQLiteTradeRepository, SupabaseTradeRepository, TradeRepository
 
@@ -22,16 +20,10 @@ __all__ = [
     "ACTIVE_TRADE_ALERT_LOG_TABLE",
     "ACTIVE_TRADES_TABLE",
     "FileSystemImportPreviewRepository",
-    "FileSystemKairosScenarioRepository",
     "ImportPreviewRepository",
     "JOURNAL_TRADES_TABLE",
     "JsonFileApolloSnapshotRepository",
-    "JsonFileKairosSnapshotRepository",
     "JsonFileTokenRepository",
-    "KairosSnapshotRepository",
-    "KairosBundleRepository",
-    "SupabaseKairosScenarioRepository",
-    "SupabaseKairosSnapshotRepository",
     "MANAGEMENT_SCHEMA",
     "MANAGEMENT_RUNTIME_SETTINGS_TABLE",
     "OpenTradeManagementStateRepository",

@@ -27,7 +27,7 @@
             <div class="hosted-shell-home-grid delphi4-sync-panel-grid">
                 <article class="hosted-shell-home-card">
                     <h3>Actions</h3>
-                    <p>Run a preview first, then import only new Delphi 4.3 trades, close events, and live Kairos tapes.</p>
+                    <p>Run a preview first, then import only new legacy 4.3 trades and close events.</p>
                     <form method="post" action="{{ sync_panel.action_url or url_for('hosted_delphi4_sync_action') }}" class="delphi4-sync-actions">
                         <button type="submit" name="sync_action" value="dry-run" class="secondary">Dry Run</button>
                         <button type="submit" name="sync_action" value="sync">Sync</button>
@@ -53,7 +53,6 @@
                         <h3>Sources</h3>
                         <div class="delphi4-sync-path-list">
                             <div><strong>Trade DB</strong><span>{{ sync_panel.source_summary.trade_database_path }}</span></div>
-                            <div><strong>Kairos Replays</strong><span>{{ sync_panel.source_summary.kairos_replay_dir }}</span></div>
                         </div>
                     </article>
                 {% endif %}
@@ -71,16 +70,12 @@
                         <div>
                             Trades: {{ sync_result.new_trade_numbers|length }}
                             | Close Events: {{ sync_result.new_close_event_count }}
-                            | Live Kairos Tapes: {{ sync_result.new_tape_scenario_keys|length }}
                         </div>
                         {% if sync_result.new_trade_numbers %}
                             <div>Trade Numbers: {{ sync_result.new_trade_numbers|join(', ') }}</div>
                         {% endif %}
-                        {% if sync_result.new_tape_session_dates %}
-                            <div>Tape Session Dates: {{ sync_result.new_tape_session_dates|join(', ') }}</div>
-                        {% endif %}
                         {% if not sync_result.had_changes %}
-                            <div>Nothing new was found in the Delphi 4.3 sources.</div>
+                            <div>Nothing new was found in the legacy 4.3 sources.</div>
                         {% endif %}
                     {% else %}
                         <div>{{ sync_result.error }}</div>
@@ -98,8 +93,8 @@
             {{ render_delphi_header(
                 active_page='home',
                 page_heading=app_identity.display_name,
-                page_copy='Mythic intelligence for modern index research, Apollo decision support, and disciplined journal review.',
-                page_meta='Delphic clarity for research, execution review, and system navigation.',
+                page_copy='Apollo execution support, Talos visibility, and disciplined journal and performance review.',
+                page_meta='Talos 2 command surface for execution review and shared system visibility.',
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
                 menu_status=menu_status,

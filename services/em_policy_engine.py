@@ -1,4 +1,4 @@
-"""Dynamic EM threshold guidance derived from completed Delphi trades."""
+"""Dynamic EM threshold guidance derived from completed Talos trades."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from .trade_store import classify_expected_move_usage, expected_move_learning_weight
 
 
-SUPPORTED_SYSTEMS = ("Apollo", "Kairos")
+SUPPORTED_SYSTEMS = ("Apollo", "Talos")
 EM_MULTIPLE_BUCKETS = (
     {"key": "<1.2", "label": "<1.2", "minimum": None, "maximum": 1.2},
     {"key": "1.2-1.4", "label": "1.2-1.4", "minimum": 1.2, "maximum": 1.4},

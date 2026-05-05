@@ -5,9 +5,7 @@ from __future__ import annotations
 from config import AppConfig
 from services.market_data import MarketDataService
 from services.repositories.hosted_runtime_state_repository import SupabaseApolloSnapshotRepository, SupabaseImportPreviewRepository
-from services.repositories.kairos_snapshot_repository import SupabaseKairosSnapshotRepository
 from services.repositories.management_state_repository import SupabaseOpenTradeManagementStateRepository
-from services.repositories.scenario_repository import SupabaseKairosScenarioRepository
 from services.repositories.trade_repository import SupabaseTradeRepository, TradeRepository
 
 from .hosted_auth import HostedAuthConfig, SupabaseHostedIdentityResolver, SupabasePrivateAccessGate, SupabaseSessionInvalidator
@@ -70,27 +68,12 @@ class HostedRuntimeServiceComposer(LocalRuntimeServiceComposer):
         )
         return trade_repository, trade_repository
 
-    def _create_kairos_snapshot_repository(self, *, storage):
-        context, integration = self._require_supabase(self.host_infrastructure)
-        return SupabaseKairosSnapshotRepository(
-            context=context,
-            gateway=integration.create_table_gateway(),
-        )
-
     def _create_apollo_snapshot_repository(self, *, storage):
         context, integration = self._require_supabase(self.host_infrastructure)
         return SupabaseApolloSnapshotRepository(
             context=context,
             gateway=integration.create_table_gateway(),
         )
-
-    def _create_kairos_scenario_repository(self, *, storage):
-        context, integration = self._require_supabase(self.host_infrastructure)
-        repository = SupabaseKairosScenarioRepository(
-            context=context,
-            gateway=integration.create_table_gateway(),
-        )
-        return repository, repository
 
     def _create_import_preview_repository(self, *, storage):
         context, integration = self._require_supabase(self.host_infrastructure)

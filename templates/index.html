@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ page_browser_title|default('Research') }} | {{ app_identity.display_name }}</title>
+    <title>{{ page_browser_title|default('Apollo') }} | {{ app_identity.display_name }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
@@ -13,11 +13,11 @@
         <section class="hero-card delphi-header-card delphi-shared-header delphi-header-card-subpage delphi-header-card-workspace">
             {{ render_delphi_header(
                 active_page=active_page,
-                page_heading=page_heading|default('Research'),
-                page_copy=page_copy|default('Live and historical index lookup with Apollo structure review and provider-aware routing.'),
+                page_heading=page_heading|default('Apollo'),
+                page_copy=page_copy|default('Talos Apollo workflow for live structure, macro review, and next-market-day candidate selection.'),
                 page_kicker=page_kicker|default(app_identity.page_kicker),
                 page_version=app_identity.version_label,
-                page_meta='Delphi research and workflow command surface.',
+                page_meta='Talos Apollo workflow command surface.',
                 menu_status=menu_status,
             ) }}
 
@@ -33,58 +33,6 @@
                 <div class="message message-warning">{{ diagnostic_message }}</div>
             {% endif %}
         </section>
-
-        {% if active_page == 'research' %}
-            <section class="panel research-workspace-panel">
-                <div class="result-header">
-                    <div>
-                        <h2>Research Workspace</h2>
-                        <p class="subtle">Query SPX and VIX data below the shared Delphi header, then review or export the returned dataset.</p>
-                    </div>
-                </div>
-
-                <form method="post" action="{{ routes.get('research', url_for('research')) }}" class="lookup-form hero-lookup-form">
-                    <div class="hero-toolbar full-width">
-                        <div class="hero-command-row">
-                            <div class="field-group hero-query-group">
-                                <label for="query_type">Query type</label>
-                                <select id="query_type" name="query_type" required>
-                                    {% for option in query_options %}
-                                        <option
-                                            value="{{ option.key }}"
-                                            data-date-mode="{{ option.date_mode }}"
-                                            {% if form_data.query_type == option.key %}selected{% endif %}
-                                        >
-                                            {{ option.label }}
-                                        </option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-
-                            <div class="actions hero-actions">
-                                <button type="submit">Run Lookup</button>
-                                <a class="button-link button-link-secondary" href="{{ routes.get('apollo', url_for('run_apollo', autorun=1)) }}">Run Apollo</a>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="field-group hero-date-field" id="single-date-group">
-                        <label for="single_date">Single date</label>
-                        <input id="single_date" name="single_date" type="date" value="{{ form_data.single_date }}">
-                    </div>
-
-                    <div class="field-group hero-date-field" id="start-date-group">
-                        <label for="start_date">Start date</label>
-                        <input id="start_date" name="start_date" type="date" value="{{ form_data.start_date }}">
-                    </div>
-
-                    <div class="field-group hero-date-field" id="end-date-group">
-                        <label for="end_date">End date</label>
-                        <input id="end_date" name="end_date" type="date" value="{{ form_data.end_date }}">
-                    </div>
-                </form>
-            </section>
-        {% endif %}
 
         {% if active_page == 'apollo' %}
             <section class="panel apollo-subtitle-panel">
@@ -117,70 +65,6 @@
             </section>
 
         {% endif %}
-
-        {% if result %}
-            <section class="panel">
-                <div class="result-header">
-                    <div>
-                        <h2>{{ result.title }}</h2>
-                        <p class="subtle">All timestamps are displayed in America/Chicago when time-of-day data is available.</p>
-                    </div>
-                    <div class="export-actions">
-                        <form method="post" action="{{ url_for('export', file_format='csv') }}">
-                            <input type="hidden" name="query_type" value="{{ form_data.query_type }}">
-                            <input type="hidden" name="single_date" value="{{ form_data.single_date }}">
-                            <input type="hidden" name="start_date" value="{{ form_data.start_date }}">
-                            <input type="hidden" name="end_date" value="{{ form_data.end_date }}">
-                            <button type="submit" class="secondary">Export CSV</button>
-                        </form>
-                        <form method="post" action="{{ url_for('export', file_format='xlsx') }}">
-                            <input type="hidden" name="query_type" value="{{ form_data.query_type }}">
-                            <input type="hidden" name="single_date" value="{{ form_data.single_date }}">
-                            <input type="hidden" name="start_date" value="{{ form_data.start_date }}">
-                            <input type="hidden" name="end_date" value="{{ form_data.end_date }}">
-                            <button type="submit" class="secondary">Export Excel</button>
-                        </form>
-                    </div>
-                </div>
-
-                <div class="summary-grid">
-                    {% for item in result.summary_items %}
-                        <article class="summary-card">
-                            <p class="summary-label">{{ item.label }}</p>
-                            <p class="summary-value">{{ item.value }}</p>
-                        </article>
-                    {% endfor %}
-                </div>
-
-                {% if result.result_note %}
-                    <div class="message message-{{ result.result_note_level }} message-inline">{{ result.result_note }}</div>
-                {% endif %}
-
-                {% if result.table_rows %}
-                    <div class="table-wrap">
-                        <table>
-                            <thead>
-                                <tr>
-                                    {% for column in result.table_columns %}
-                                        <th>{{ column }}</th>
-                                    {% endfor %}
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for row in result.table_rows %}
-                                    <tr>
-                                        {% for column in result.table_columns %}
-                                            <td>{{ row[column] }}</td>
-                                        {% endfor %}
-                                    </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                {% endif %}
-            </section>
-        {% endif %}
-
         {% if apollo_result %}
             <section class="panel apollo-panel">
                 <div class="apollo-upper-grid apollo-top-layout">

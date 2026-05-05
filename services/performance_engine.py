@@ -10,10 +10,10 @@ from .trade_store import (
     build_learning_trade_fields,
     normalize_macro_flag,
     normalize_structure_label,
-    normalize_system_name,
+    resolve_trade_system_name,
 )
 
-SYSTEM_GROUPS = ("Apollo", "Kairos", "Aegis")
+SYSTEM_GROUPS = ("Apollo", "Talos")
 STRUCTURE_GROUPS = ("Good", "Neutral", "Poor")
 VIX_BUCKETS = ("<18", "18-22", "22-26", "26+")
 
@@ -44,9 +44,11 @@ class PerformanceEngine:
 
     def load_trades(self) -> list[Dict[str, Any]]:
         trades: list[Dict[str, Any]] = []
-        for trade_mode in ("real", "simulated"):
+        for trade_mode in ("real", "simulated", "talos"):
             for trade in self.store.list_trades(trade_mode):
-                trades.append(self._build_enriched_trade(trade))
+                enriched = self._build_enriched_trade(trade)
+                if enriched.get("system") in SYSTEM_GROUPS:
+                    trades.append(enriched)
         return trades
 
     def get_overall_performance(self) -> Dict[str, float | int]:
@@ -88,7 +90,7 @@ class PerformanceEngine:
             **trade,
             **base,
             "trade_mode": str(trade.get("trade_mode") or "").strip().lower(),
-            "system": normalize_system_name(base.get("system") or trade.get("system_name")),
+            "system": resolve_trade_system_name({**trade, **base}),
             "structure": normalize_structure_label(base.get("structure") or trade.get("structure_grade")),
             "macro_flag": normalize_macro_flag(base.get("macro_flag") or trade.get("macro_grade")),
             "credit_received": credit_received,

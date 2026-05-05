@@ -1,15 +1,13 @@
 {% macro render_nav_button(label, href, key, active_page, secondary=false) -%}
     {% set is_active = active_page == key or (key == 'journal' and active_page in ['journal', 'real-trades', 'simulated-trades']) %}
-    <a class="button-link{% if secondary %} button-link-secondary{% endif %}{% if is_active %} button-link-active{% endif %}" href="{{ href }}" data-delphi-nav="{{ key }}"{% if is_active %} aria-current="page"{% endif %}{% if key in ['apollo', 'kairos'] %} data-refresh-market-status="true"{% endif %}>{{ label }}</a>
+    <a class="button-link{% if secondary %} button-link-secondary{% endif %}{% if is_active %} button-link-active{% endif %}" href="{{ href }}" data-delphi-nav="{{ key }}"{% if is_active %} aria-current="page"{% endif %}{% if key == 'apollo' %} data-refresh-market-status="true"{% endif %}>{{ label }}</a>
 {%- endmacro %}
 
-{% macro render_delphi_header(active_page, page_heading, page_copy, page_kicker='Delphi 8.0.7 Local', page_meta='Delphi workflow shell.', page_version='Version 8.0.7', header_variant='subpage', menu_status=None) -%}
+{% macro render_delphi_header(active_page, page_heading, page_copy, page_kicker='TALOS 2.0.1', page_meta='Talos workflow shell.', page_version='TALOS 2.0.1', header_variant='subpage', menu_status=None) -%}
     {% set routes = delphi_routes if delphi_routes is defined and delphi_routes else {} %}
     {% set header_icons = {
         'management': 'icons/delphi-icon.png',
-        'research': 'icons/delphi-icon.png',
         'apollo': 'icons/apollo-icon.png',
-        'kairos': 'icons/kairos-icon.png',
         'journal': 'icons/journal-icon.png',
         'performance': 'icons/performance-icon.png',
     } %}
@@ -103,9 +101,7 @@
 
         <div class="delphi-header-nav" aria-label="Primary navigation">
             {{ render_nav_button('Home', routes.get('management', url_for('open_trade_management_page')), 'management', active_page) }}
-            {{ render_nav_button('Research', routes.get('research', url_for('research')), 'research', active_page) }}
             {{ render_nav_button('Run Apollo', routes.get('apollo', url_for('run_apollo', autorun=1)), 'apollo', active_page) }}
-            {{ render_nav_button('Run Kairos', routes.get('kairos', url_for('kairos_live_page')), 'kairos', active_page) }}
             {{ render_nav_button('Performance', routes.get('performance', url_for('performance_dashboard')), 'performance', active_page) }}
             {{ render_nav_button('Journal', routes.get('journal', url_for('trade_dashboard', trade_mode='real')), 'journal', active_page) }}
         </div>

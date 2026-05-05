@@ -16,9 +16,11 @@ VALID_TRADE_MODES = {"real", "simulated", "talos"}
 VALID_STATUSES = {"open", "closed", "expired", "cancelled"}
 VALID_CLOSE_EVENT_TYPES = {"reduce", "close", "expire"}
 VALID_CLOSE_METHODS = {"Reduce", "Close", "Expire", "Manage Trade Prefill"}
-VALID_SYSTEM_NAMES = {"Apollo", "Kairos", "Aegis"}
+VALID_SYSTEM_NAMES = {"Apollo", "Talos", "Fortress"}
+RETAINED_SYSTEM_NAMES = {"Apollo", "Talos"}
 VALID_CANDIDATE_PROFILES = {"Legacy", "Aggressive", "Fortress", "Standard", "Prime", "Subprime"}
 DEFAULT_SYSTEM_NAME = "Apollo"
+UNKNOWN_SYSTEM_NAME = "Other"
 DEFAULT_CANDIDATE_PROFILE = "Legacy"
 CHICAGO_TZ = ZoneInfo("America/Chicago")
 JOURNAL_NAME_DEFAULT = "Apollo Main"
@@ -1390,13 +1392,69 @@ def normalize_trade_mode(value: Any) -> str:
 def normalize_system_name(value: Any) -> str:
     text = str(value or "").strip()
     lowered = text.lower()
-    if "aegis" in lowered:
-        return "Aegis"
+    if "talos" in lowered:
+        return "Talos"
     if "kairos" in lowered:
         return "Kairos"
+    if "fortress" in lowered or "aegis" in lowered:
+        return "Fortress"
     if "apollo" in lowered:
         return "Apollo"
     return DEFAULT_SYSTEM_NAME
+
+
+def _trade_marker_fields(trade: Dict[str, Any]) -> tuple[str, ...]:
+    return (
+        str(trade.get("trade_mode") or ""),
+        str(trade.get("system_name") or ""),
+        str(trade.get("system") or ""),
+        str(trade.get("journal_name") or ""),
+        str(trade.get("source") or ""),
+        str(trade.get("engine") or ""),
+        str(trade.get("category") or ""),
+        str(trade.get("prefill_source") or ""),
+        str(trade.get("automation_status") or ""),
+        str(trade.get("pass_type") or ""),
+        str(trade.get("boundary_rule_used") or ""),
+        str(trade.get("notes_entry") or ""),
+        str(trade.get("notes_exit") or ""),
+        str(trade.get("close_reason") or ""),
+    )
+
+
+def _trade_matches_any_marker(trade: Dict[str, Any], markers: tuple[str, ...]) -> bool:
+    marker_fields = tuple(value.lower() for value in _trade_marker_fields(trade) if value)
+    return any(marker in value for value in marker_fields for marker in markers)
+
+
+def resolve_trade_system_name(trade: Dict[str, Any]) -> str:
+    talos_markers = ("talos",)
+    kairos_markers = (
+        "kairos",
+        "prefilled from kairos",
+        "kairos best candidate",
+        "kairos tape",
+        "kairos live",
+        "kairos sim",
+    )
+    apollo_markers = ("apollo",)
+    trade_mode = str(trade.get("trade_mode") or "").strip().lower()
+    if trade_mode == "talos" or _trade_matches_any_marker(trade, talos_markers):
+        return "Talos"
+    if trade_mode == "kairos" or _trade_matches_any_marker(trade, kairos_markers):
+        return "Kairos"
+    raw_explicit_system = str(trade.get("system_name") or trade.get("system") or "").strip()
+    if raw_explicit_system:
+        explicit_system = normalize_system_name(raw_explicit_system)
+        if explicit_system == "Apollo":
+            return "Apollo"
+    if _trade_matches_any_marker(trade, apollo_markers) and trade_mode in {"real", "simulated", ""}:
+        return "Apollo"
+    return UNKNOWN_SYSTEM_NAME
+
+
+def is_retained_trade_system(trade: Dict[str, Any]) -> bool:
+    return resolve_trade_system_name(trade) in RETAINED_SYSTEM_NAMES
 
 
 def normalize_structure_label(value: Any) -> Optional[str]:

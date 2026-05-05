@@ -11,12 +11,12 @@
     <main class="page-shell hosted-shell-layout">
         <section class="hero-card delphi-header-card delphi-shared-header delphi-header-card-subpage">
             {{ render_delphi_header(
-                active_page=active_page|default('research'),
+                active_page=active_page|default('management'),
                 page_heading=page_heading,
                 page_copy=page_copy,
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
-                page_meta='Delphi 7.2.11 web surface using the shared Delphi engines and live Schwab-connected services.',
+                page_meta='Talos 2.0.1 hosted surface using the retained Apollo flows and live Schwab-connected services.',
                 menu_status=menu_status,
             ) }}
 
@@ -24,7 +24,7 @@
                 <div class="hosted-shell-toolbar">
                     <div class="hosted-shell-toolbar-meta">
                         <span class="hosted-shell-sync-badge" id="hosted-shell-sync-badge">Server rendered</span>
-                        <span class="hosted-shell-sync-detail" id="hosted-shell-sync-detail">Run executes against Schwab. Refresh reloads the latest captured Delphi web state.</span>
+                        <span class="hosted-shell-sync-detail" id="hosted-shell-sync-detail">Run executes against Schwab. Refresh reloads the latest captured Talos web state.</span>
                     </div>
                     <div class="hosted-shell-toolbar-actions">
                         {% if hosted_run_action_url %}

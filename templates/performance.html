@@ -15,7 +15,7 @@
                 active_page='performance',
                 page_heading='Performance',
                 page_copy='Visual dashboard for trade behavior, risk, and progression at a glance.',
-                page_meta='Chart-first command view for Apollo, Legacy, and Kairos performance.',
+                page_meta='Chart-first command view for retained Apollo and Talos performance.',
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
                 menu_status=menu_status,
@@ -133,7 +133,7 @@
 
         <section class="panel performance-learning-panel">
             <div class="performance-panel-header">
-                <h2>{% if hosted_mode %}Delphi 8.0.7 Hosted Learning Metrics{% else %}Performance Learning Metrics{% endif %}</h2>
+                <h2>{% if hosted_mode %}Talos 2.0.1 Hosted Learning Metrics{% else %}Performance Learning Metrics{% endif %}</h2>
                 <span class="subtle">Decision-useful trade-quality analytics derived from current stored trade history, timestamps, close events, VIX, and EM metadata.</span>
             </div>
 
@@ -440,7 +440,7 @@
                             weighted_support: 0,
                         },
                         apollo: null,
-                        kairos: null,
+                        talos: null,
                     },
                     trade_mode_split: safePayload.learning?.trade_mode_split || { items: [] },
                     result_audit: safePayload.learning?.result_audit || { counts: {}, rules: [] },
@@ -1312,7 +1312,7 @@
             if (!target) {
                 return;
             }
-            const systems = [payload?.apollo, payload?.kairos].filter(Boolean);
+            const systems = [payload?.apollo, payload?.talos].filter(Boolean);
             const qualifiedTrades = Number(payload?.qualified_trade_count || 0);
             if (!systems.length || qualifiedTrades <= 0) {
                 target.innerHTML = '<div class="performance-empty-state">Not enough completed EM-tagged trades yet for dynamic threshold guidance.</div>';
@@ -1343,7 +1343,7 @@
             if (!target) {
                 return;
             }
-            const systems = [payload?.apollo, payload?.kairos].filter(Boolean);
+            const systems = [payload?.apollo, payload?.talos].filter(Boolean);
             const cards = systems.flatMap((item) => {
                 const vixGuidance = item?.vix_guidance || {};
                 return Object.entries(vixGuidance).map(([bucket, guidance]) => ({
@@ -1380,7 +1380,7 @@
             if (!target) {
                 return;
             }
-            const systems = [payload?.apollo, payload?.kairos].filter(Boolean);
+            const systems = [payload?.apollo, payload?.talos].filter(Boolean);
             if (!systems.length) {
                 target.innerHTML = '<div class="performance-empty-state">Awaiting more EM-tagged trades.</div>';
                 return;
@@ -1412,7 +1412,7 @@
             if (!target) {
                 return;
             }
-            const systems = [payload?.apollo, payload?.kairos].filter(Boolean);
+            const systems = [payload?.apollo, payload?.talos].filter(Boolean);
             const excludedReasons = payload?.excluded_reasons || {};
             const excludedItems = Object.entries(excludedReasons);
             const usage = payload?.expected_move_usage_summary || {};

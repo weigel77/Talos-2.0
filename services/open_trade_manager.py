@@ -11,8 +11,6 @@ from threading import RLock
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
-import pandas as pd
-
 from config import AppConfig, get_app_config
 
 from .apollo_service import ApolloService
@@ -39,11 +37,11 @@ from .trade_notifications import (
 )
 from .trade_store import (
     current_timestamp,
-    normalize_system_name,
     parse_date_value,
     parse_datetime_value,
     resolve_trade_candidate_profile,
     resolve_trade_credit_model,
+    resolve_trade_system_name,
     summarize_trade_close_events,
     to_float,
 )
@@ -78,8 +76,8 @@ class OpenTradeManager:
     BACKGROUND_INTERVAL_SECONDS = 60
     APOLLO_HEALTHY_EM_THRESHOLD = 2.0
     APOLLO_WATCH_EM_THRESHOLD = 1.5
-    KAIROS_HEALTHY_EM_THRESHOLD = 3.0
-    KAIROS_WATCH_EM_THRESHOLD = 1.5
+    TALOS_HEALTHY_EM_THRESHOLD = 3.0
+    TALOS_WATCH_EM_THRESHOLD = 1.5
 
     def __init__(
         self,
@@ -88,7 +86,6 @@ class OpenTradeManager:
         market_data_service: MarketDataService,
         apollo_service: ApolloService,
         options_chain_service: OptionsChainService,
-        kairos_service: Any,
         notification_delivery: NotificationDelivery | None = None,
         pushover_service: NotificationDelivery | None = None,
         market_calendar_service: MarketCalendarService | None = None,
@@ -109,7 +106,6 @@ class OpenTradeManager:
             raise ValueError("OpenTradeManager requires a notification delivery adapter.")
         self.notification_delivery = notification_delivery
         self.pushover_service = notification_delivery
-        self.kairos_service = kairos_service
         self.market_calendar_service = market_calendar_service or MarketCalendarService(self.config)
         self.database_path = Path(self.trade_store.database_path)
         self.state_repository = state_repository or SQLiteOpenTradeManagementStateRepository(self.database_path)
@@ -365,9 +361,8 @@ class OpenTradeManager:
         }
 
     def _build_shared_context(self, open_trades: List[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
-        normalized_systems = {str(item.get("system_name") or "").strip().lower() for item in open_trades}
+        normalized_systems = {resolve_trade_system_name(item).strip().lower() for item in open_trades}
         has_apollo_trades = "apollo" in normalized_systems
-        has_kairos_trades = "kairos" in normalized_systems
         with ThreadPoolExecutor(max_workers=2) as executor:
             spx_future = executor.submit(self._safe_snapshot, "^GSPC", query_type="open_trade_management_spx")
             vix_future = executor.submit(self._safe_snapshot, "^VIX", query_type="open_trade_management_vix")
@@ -396,20 +391,15 @@ class OpenTradeManager:
         )
 
         apollo_context: Dict[str, Any] = {}
-        kairos_context: Dict[str, Any] = {}
         context_futures: Dict[Any, str] = {}
-        context_worker_count = int(has_apollo_trades) + int(has_kairos_trades)
+        context_worker_count = int(has_apollo_trades)
         if context_worker_count > 0:
             with ThreadPoolExecutor(max_workers=context_worker_count) as executor:
                 if has_apollo_trades:
                     context_futures[executor.submit(self._build_apollo_management_context)] = "apollo"
-                if has_kairos_trades:
-                    context_futures[executor.submit(self._build_kairos_context, now)] = "kairos"
                 for future, context_name in context_futures.items():
                     if context_name == "apollo":
                         apollo_context = future.result()
-                    else:
-                        kairos_context = future.result()
         return {
             "now": now,
             "spx_snapshot": spx_snapshot,
@@ -417,7 +407,6 @@ class OpenTradeManager:
             "option_chains": option_chains,
             "prepared_option_chains": prepared_option_chains,
             "apollo": apollo_context,
-            "kairos": kairos_context,
             "current_spx": current_spx,
             "current_vix": self._coerce_float((vix_snapshot or {}).get("Latest Value")),
         }
@@ -485,113 +474,27 @@ class OpenTradeManager:
                     expiration_date=expiration_date,
                     evaluation_date=evaluation_date,
                 ),
-                "kairos": self._build_expected_move_details_from_normalized(
+                "talos": self._build_expected_move_details_from_normalized(
                     normalized_puts=normalized_puts,
                     normalized_calls=normalized_calls,
                     spot=spot,
-                    system_name="Kairos",
+                    system_name="Talos",
                     expiration_date=expiration_date,
                     evaluation_date=evaluation_date,
                 ),
             }
         return prepared
 
-    def _build_kairos_context(self, now: datetime) -> Dict[str, Any]:
-        management_context: Dict[str, Any] = {}
-        try:
-            management_context_builder = getattr(self.kairos_service, "build_management_context", None)
-            if callable(management_context_builder):
-                management_context = management_context_builder() if self.kairos_service is not None else {}
-            elif self.kairos_service is not None:
-                dashboard = self.kairos_service.get_dashboard_payload()
-                latest_scan = dashboard.get("latest_scan") or {}
-                management_context = {
-                    "current_structure_status": latest_scan.get("structure_status"),
-                    "current_momentum_status": latest_scan.get("momentum_status"),
-                }
-        except Exception as exc:  # pragma: no cover - defensive provider handling
-            LOGGER.warning("Kairos management context unavailable: %s", exc)
-            management_context = {}
-
-        intraday = self._build_intraday_kairos_context(now)
-        return {
-            "current_structure_status": self._coerce_text(management_context.get("current_structure_status") or intraday.get("structure_status"), fallback="Developing"),
-            "below_vwap": intraday.get("below_vwap", False),
-        }
-
-    def _build_intraday_kairos_context(self, now: datetime) -> Dict[str, Any]:
-        try:
-            requested_session_date = now.date()
-            session_request_resolver = getattr(self.market_data_service, "resolve_intraday_session_request", None)
-            if callable(session_request_resolver):
-                session_request = session_request_resolver(requested_session_date, current_time=now)
-                resolved_session_date = session_request.get("resolved_session_date", requested_session_date)
-                normalization_reason = str(session_request.get("normalization_reason") or "")
-            else:
-                resolved_session_date = requested_session_date
-                normalization_reason = ""
-            if resolved_session_date != requested_session_date:
-                LOGGER.info(
-                    "Open trade intraday session normalized | requested_session_date=%s | resolved_session_date=%s | reason=%s",
-                    requested_session_date.isoformat(),
-                    resolved_session_date.isoformat(),
-                    normalization_reason or "latest valid tradable session",
-                )
-            if hasattr(self.market_data_service, "get_intraday_candles_for_date"):
-                frame = self.market_data_service.get_intraday_candles_for_date(
-                    "^GSPC",
-                    target_date=resolved_session_date,
-                    interval_minutes=1,
-                    query_type="open_trade_management_kairos_intraday",
-                )
-            else:
-                frame = self.market_data_service.get_same_day_intraday_candles(
-                    "^GSPC",
-                    interval_minutes=1,
-                    query_type="open_trade_management_kairos_intraday",
-                )
-        except MarketDataError:
-            return {}
-        if frame is None or frame.empty:
-            return {}
-
-        working = frame.copy()
-        working["Datetime"] = pd.to_datetime(working["Datetime"], errors="coerce")
-        working = working.dropna(subset=["Datetime", "Open", "High", "Low", "Close"])
-        if working.empty:
-            return {}
-
-        latest = working.iloc[-1]
-        current_close = self._coerce_float(latest.get("Close"), fallback=0.0)
-        session_open = self._coerce_float(working.iloc[0].get("Open"), fallback=current_close)
-        volume_series = pd.to_numeric(working.get("Volume"), errors="coerce").fillna(0)
-        typical_price = (pd.to_numeric(working["High"], errors="coerce") + pd.to_numeric(working["Low"], errors="coerce") + pd.to_numeric(working["Close"], errors="coerce")) / 3.0
-        cumulative_volume = float(volume_series.sum())
-        current_vwap = float(((typical_price * volume_series).sum() / cumulative_volume) if cumulative_volume > 0 else current_close)
-        net_change_percent = self._percent_change(current_close, session_open)
-        if current_close < current_vwap and net_change_percent <= -0.18:
-            structure_status = "Failed"
-        elif current_close < current_vwap:
-            structure_status = "Weakening"
-        elif current_close > current_vwap and net_change_percent >= 0.08:
-            structure_status = "Bullish Confirmation"
-        else:
-            structure_status = "Developing"
-        return {
-            "below_vwap": bool(current_close < current_vwap),
-            "structure_status": structure_status,
-        }
-
     def _evaluate_trade(self, trade: Dict[str, Any], shared_context: Dict[str, Any], now: datetime) -> Dict[str, Any]:
-        system_name = normalize_system_name(trade.get("system_name"))
+        system_name = resolve_trade_system_name(trade)
         trade_mode = str(trade.get("trade_mode") or "").strip().title() or "Unknown"
         option_type = self._coerce_text(trade.get("option_type"), fallback="Put Credit Spread")
         current_underlying = self._coerce_float(shared_context.get("current_spx"), fallback=self._coerce_float(trade.get("spx_at_entry"), fallback=0.0))
         current_vix = self._coerce_float(shared_context.get("current_vix"))
         metrics = self._build_live_metrics(trade, current_underlying=current_underlying, current_vix=current_vix, shared_context=shared_context, now=now)
 
-        if system_name == "Kairos":
-            classification = self._classify_kairos_trade(trade, metrics, shared_context.get("kairos") or {}, now)
+        if system_name == "Talos":
+            classification = self._classify_talos_trade(trade, metrics)
             profile_label = resolve_trade_candidate_profile(trade)
         else:
             classification = self._classify_apollo_trade(trade, metrics, shared_context.get("apollo") or {}, now)
@@ -744,7 +647,7 @@ class OpenTradeManager:
             chain_summary=chain_summary,
             prepared_chain=prepared_chain,
             spot=current_underlying,
-            system_name=normalize_system_name(trade.get("system_name")),
+            system_name=resolve_trade_system_name(trade),
             expiration_date=expiration_date,
             evaluation_date=now.date(),
         )
@@ -860,58 +763,53 @@ class OpenTradeManager:
             **action_plan,
         }
 
-    def _classify_kairos_trade(self, trade: Dict[str, Any], metrics: Dict[str, Any], kairos_context: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    def _classify_talos_trade(self, trade: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
         distance_to_short = float(metrics.get("distance_to_short") or 0.0)
         distance_to_long = float(metrics.get("distance_to_long") or 0.0)
-        current_structure = self._coerce_text(kairos_context.get("current_structure_status"), fallback="Developing")
-        below_vwap = bool(kairos_context.get("below_vwap"))
+        current_structure = self._coerce_text(resolve_trade_system_name(trade), fallback="Talos")
         current_live_expected_move = self._coerce_float(metrics.get("current_live_expected_move"))
         em_multiple = self._safe_divide(distance_to_short, current_live_expected_move)
-        short_watch_zone = em_multiple < self.KAIROS_HEALTHY_EM_THRESHOLD
-        short_trim_zone = em_multiple < self.KAIROS_WATCH_EM_THRESHOLD
+        short_watch_zone = em_multiple < self.TALOS_HEALTHY_EM_THRESHOLD
         short_hard_stop = self._is_strike_breached(distance_to_short)
         long_breach = self._is_long_stop_breached(distance_to_short=distance_to_short, distance_to_long=distance_to_long)
-        thesis_status, thesis_reason_code = self._derive_kairos_thesis_status(current_structure, below_vwap)
-        structure_trigger_fired = thesis_status in {"bearish", "broken"}
-        vwap_trigger_fired = below_vwap
         if long_breach or short_hard_stop or em_multiple < 1.0:
             status = "Exit Now"
-            status_reason_code = "kairos-em-exit-now"
-            reason = "Kairos spread has breached its short or long stop and should be fully exited."
+            status_reason_code = "talos-em-exit-now"
+            reason = "Talos spread has breached its short or long stop and should be fully exited."
         elif em_multiple < 1.2:
             status = "Exit Partial"
-            status_reason_code = "kairos-em-exit-partial"
-            reason = f"Kairos spread is down to {em_multiple:.2f}x current same-day expected-move clearance and needs a partial exit."
-        elif em_multiple >= self.KAIROS_HEALTHY_EM_THRESHOLD:
+            status_reason_code = "talos-em-exit-partial"
+            reason = f"Talos spread is down to {em_multiple:.2f}x current same-day expected-move clearance and needs a partial exit."
+        elif em_multiple >= self.TALOS_HEALTHY_EM_THRESHOLD:
             status = "Healthy"
-            status_reason_code = "kairos-em-healthy"
-            reason = f"Kairos spread retains {em_multiple:.2f}x current same-day expected-move clearance to the short strike."
-        elif em_multiple >= self.KAIROS_WATCH_EM_THRESHOLD:
+            status_reason_code = "talos-em-healthy"
+            reason = f"Talos spread retains {em_multiple:.2f}x current same-day expected-move clearance to the short strike."
+        elif em_multiple >= self.TALOS_WATCH_EM_THRESHOLD:
             status = "Watch"
-            status_reason_code = "kairos-em-watch"
-            reason = f"Kairos spread has compressed to {em_multiple:.2f}x current same-day expected-move clearance and should be watched."
+            status_reason_code = "talos-em-watch"
+            reason = f"Talos spread has compressed to {em_multiple:.2f}x current same-day expected-move clearance and should be watched."
         else:
             status = "Exit Approaching"
-            status_reason_code = "kairos-em-exit-approaching"
-            reason = f"Kairos spread is down to {em_multiple:.2f}x current same-day expected-move clearance and is approaching exit territory."
+            status_reason_code = "talos-em-exit-approaching"
+            reason = f"Talos spread is down to {em_multiple:.2f}x current same-day expected-move clearance and is approaching exit territory."
 
         action_plan = self._build_action_plan(status, int(metrics.get("remaining_contracts") or 0), metrics)
         next_trigger, next_trigger_action = self._build_price_ladder_next_trigger(trade, metrics)
         exit_plan_summary = self._build_exit_plan_summary(trade, metrics)
         return {
             "status": status,
-            "thesis_status": thesis_status,
+            "thesis_status": "managed",
             "reason": reason,
             "status_reason_code": status_reason_code,
-            "thesis_reason_code": thesis_reason_code,
+            "thesis_reason_code": "talos-governed",
             "next_trigger": next_trigger,
             "exit_plan_summary": exit_plan_summary,
             "exit_plan_gates": self._build_exit_plan_gates(trade, metrics),
             "trigger_source": next_trigger_action,
             "current_structure_grade": current_structure,
             "status_em_multiple": em_multiple,
-            "structure_trigger_fired": structure_trigger_fired,
-            "vwap_trigger_fired": vwap_trigger_fired,
+            "structure_trigger_fired": False,
+            "vwap_trigger_fired": False,
             "short_proximity_trigger_fired": short_watch_zone,
             "long_proximity_trigger_fired": long_breach,
             "final_stop_trigger_fired": bool(short_hard_stop or long_breach),
@@ -984,7 +882,7 @@ class OpenTradeManager:
 
     def _load_open_trades(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        for trade_mode in ("real", "simulated"):
+        for trade_mode in ("real", "simulated", "talos"):
             rows.extend(
                 trade
                 for trade in self.trade_store.list_trades(trade_mode)
@@ -1186,17 +1084,6 @@ class OpenTradeManager:
     def _is_trigger_crossed(current_spx: float, trigger_level: float, *, is_call: bool) -> bool:
         return current_spx >= trigger_level if is_call else current_spx <= trigger_level
 
-    @staticmethod
-    def _derive_kairos_thesis_status(current_structure: str, below_vwap: bool) -> tuple[str, str]:
-        normalized = str(current_structure or "").strip().lower()
-        if normalized == "failed":
-            return "broken", "kairos-structure-broken"
-        if normalized in {"weakening", "expired"} or below_vwap:
-            return "bearish", "kairos-structure-bearish"
-        if "bullish" in normalized or normalized == "improving":
-            return "bullish", "kairos-structure-bullish"
-        return "chop", "kairos-structure-chop"
-
     def _resolve_current_spread_mark(self, trade: Dict[str, Any], shared_context: Dict[str, Any]) -> float | None:
         expiration = self._coerce_trade_expiration(trade)
         if expiration is None:
@@ -1251,7 +1138,11 @@ class OpenTradeManager:
                 "contracts_label": "—",
             }
 
-        system_key = "kairos" if normalize_system_name(system_name) == "Kairos" else "apollo"
+        normalized_system_name = resolve_trade_system_name({"system_name": system_name})
+        if normalized_system_name == "Talos":
+            system_key = "talos"
+        else:
+            system_key = "apollo"
         prepared_expected_moves = (prepared_chain or {}).get("expected_move_by_system") or {}
         cached_details = prepared_expected_moves.get(system_key)
         if isinstance(cached_details, dict) and cached_details:
@@ -1303,7 +1194,7 @@ class OpenTradeManager:
         source_label = "Current trade-horizon ATM straddle"
         if expiration_date is not None and expiration_date == evaluation_date:
             source_label = "Same-day ATM straddle"
-        if system_name == "Kairos":
+        if system_name == "Talos":
             source_label = "Current same-day ATM straddle"
 
         return {
@@ -1501,7 +1392,7 @@ class OpenTradeManager:
 
     def _alert_profile_label(self, record: Dict[str, Any]) -> str:
         system_name = str(record.get("system_name") or "").strip().lower()
-        if system_name == "kairos":
+        if system_name == "talos":
             pass_type = self._coerce_text(record.get("pass_type"), fallback="")
             if pass_type:
                 return pass_type

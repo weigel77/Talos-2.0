@@ -9,9 +9,6 @@ from flask import Flask
 
 from config import AppConfig
 from services.apollo_service import ApolloService
-from services.export_service import ExportService
-from services.kairos_scenario_repository import KairosScenarioRepository
-from services.kairos_service import KairosService
 from services.market_data import MarketDataService
 from services.open_trade_manager import OpenTradeManager
 from services.options_chain_service import OptionsChainService
@@ -21,9 +18,7 @@ from services.pushover_service import PushoverService
 from services.talos_service import NoopTalosService, TalosService
 from services.repositories.apollo_snapshot_repository import ApolloSnapshotRepository, JsonFileApolloSnapshotRepository
 from services.repositories.import_preview_repository import FileSystemImportPreviewRepository, ImportPreviewRepository
-from services.repositories.kairos_snapshot_repository import JsonFileKairosSnapshotRepository, KairosSnapshotRepository
 from services.repositories.management_state_repository import OpenTradeManagementStateRepository
-from services.repositories.scenario_repository import FileSystemKairosScenarioRepository, KairosBundleRepository
 from services.repositories.trade_repository import MirroredTradeRepository, SQLiteTradeRepository, SupabaseTradeRepository, TradeRepository
 from services.runtime.private_access import LocalPrivateAccessGate, LocalRequestIdentityResolver, NoopSessionInvalidator, PrivateAccessGate, RequestIdentityResolver, SessionInvalidator
 from services.runtime.notifications import PushoverNotificationDelivery
@@ -41,13 +36,9 @@ from .provider_composition import LocalProviderComposer, ProviderComposer
 class RuntimeServiceBundle:
     host_infrastructure: HostInfrastructure
     market_data_service: MarketDataService
-    export_service: ExportService
     apollo_service: ApolloService
     apollo_snapshot_repository: ApolloSnapshotRepository
-    kairos_snapshot_repository: KairosSnapshotRepository
     runtime_scheduler: ThreadingTimerScheduler
-    kairos_scenario_repository_backend: Any
-    kairos_scenario_repository: KairosBundleRepository
     trade_store_backend: Any
     trade_store: TradeRepository
     import_preview_repository: ImportPreviewRepository
@@ -57,8 +48,6 @@ class RuntimeServiceBundle:
     session_invalidator: SessionInvalidator
     pushover_service: PushoverService
     notification_delivery: PushoverNotificationDelivery
-    kairos_live_service: KairosService
-    kairos_sim_service: KairosService
     performance_service: PerformanceDashboardService
     performance_engine: PerformanceEngine
     open_trade_manager: OpenTradeManager
@@ -102,10 +91,7 @@ class LocalRuntimeServiceComposer:
         runtime_scheduler = ThreadingTimerScheduler()
         storage = self.host_infrastructure.storage
         market_data_service = MarketDataService(config=self.config, provider_composer=self.provider_composer)
-        export_service = ExportService()
         apollo_snapshot_repository = self._create_apollo_snapshot_repository(storage=storage)
-        kairos_snapshot_repository = self._create_kairos_snapshot_repository(storage=storage)
-        kairos_scenario_repository_backend, kairos_scenario_repository = self._create_kairos_scenario_repository(storage=storage)
         trade_store_backend, trade_store = self._create_trade_repository(market_data_service)
         import_preview_repository = self._create_import_preview_repository(storage=storage)
         request_identity_resolver, private_access_gate, session_invalidator = self._create_auth_components(app)
@@ -128,23 +114,6 @@ class LocalRuntimeServiceComposer:
             options_chain_service=apollo_options_chain_service,
             config=self.config,
         )
-        kairos_live_service = KairosService(
-            market_data_service=market_data_service,
-            options_chain_service=apollo_options_chain_service,
-            config=self.config,
-            scenario_repository=kairos_scenario_repository,
-            pushover_service=notification_delivery,
-            trade_store=trade_store,
-        )
-        kairos_sim_service = KairosService(
-            market_data_service=market_data_service,
-            options_chain_service=apollo_options_chain_service,
-            config=self.config,
-            replay_storage_dir=str(storage.kairos_replay_storage_dir),
-            scenario_repository=kairos_scenario_repository,
-            trade_store=trade_store,
-        )
-        kairos_sim_service.configure_runtime({"mode": "Simulation"})
         performance_service = PerformanceDashboardService(trade_store)
         performance_engine = PerformanceEngine(trade_store)
         trade_store.initialize()
@@ -155,7 +124,6 @@ class LocalRuntimeServiceComposer:
             apollo_service=apollo_service,
             options_chain_service=apollo_service.options_chain_service,
             notification_delivery=notification_delivery,
-            kairos_service=kairos_live_service,
             config=self.config,
             state_repository=management_state_repository,
             scheduler=runtime_scheduler,
@@ -168,7 +136,6 @@ class LocalRuntimeServiceComposer:
                 options_chain_service=apollo_service.options_chain_service,
                 open_trade_manager=open_trade_manager,
                 config=self.config,
-                scenario_repository=kairos_scenario_repository,
                 scheduler=runtime_scheduler,
                 state_path=storage.instance_path / "talos_state.json",
             )
@@ -186,19 +153,13 @@ class LocalRuntimeServiceComposer:
                 startup=(None if app.testing else talos_service.start_background_monitoring),
                 shutdown=talos_service.shutdown,
             ),
-            RuntimeComponent(name="kairos_live_service", shutdown=kairos_live_service.shutdown),
-            RuntimeComponent(name="kairos_sim_service", shutdown=kairos_sim_service.shutdown),
         ]
         return RuntimeServiceBundle(
             host_infrastructure=self.host_infrastructure,
             market_data_service=market_data_service,
-            export_service=export_service,
             apollo_service=apollo_service,
             apollo_snapshot_repository=apollo_snapshot_repository,
-            kairos_snapshot_repository=kairos_snapshot_repository,
             runtime_scheduler=runtime_scheduler,
-            kairos_scenario_repository_backend=kairos_scenario_repository_backend,
-            kairos_scenario_repository=kairos_scenario_repository,
             trade_store_backend=trade_store_backend,
             trade_store=trade_store,
             import_preview_repository=import_preview_repository,
@@ -208,8 +169,6 @@ class LocalRuntimeServiceComposer:
             session_invalidator=session_invalidator,
             pushover_service=pushover_service,
             notification_delivery=notification_delivery,
-            kairos_live_service=kairos_live_service,
-            kairos_sim_service=kairos_sim_service,
             performance_service=performance_service,
             performance_engine=performance_engine,
             open_trade_manager=open_trade_manager,
@@ -241,17 +200,6 @@ class LocalRuntimeServiceComposer:
 
     def _create_import_preview_repository(self, *, storage) -> ImportPreviewRepository:
         return FileSystemImportPreviewRepository(storage.import_preview_root)
-
-    def _create_kairos_snapshot_repository(self, *, storage) -> KairosSnapshotRepository:
-        return JsonFileKairosSnapshotRepository(storage.instance_path / "kairos_last_run.json")
-
-    def _create_kairos_scenario_repository(self, *, storage) -> tuple[Any, KairosBundleRepository]:
-        kairos_scenario_repository_backend = KairosScenarioRepository(
-            storage.kairos_replay_storage_dir,
-            legacy_storage_dirs=list(storage.kairos_legacy_storage_dirs),
-        )
-        kairos_scenario_repository = FileSystemKairosScenarioRepository(repository=kairos_scenario_repository_backend)
-        return kairos_scenario_repository_backend, kairos_scenario_repository
 
     def _create_management_state_repository(self, trade_store: TradeRepository) -> OpenTradeManagementStateRepository | None:
         return None

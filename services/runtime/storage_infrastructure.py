@@ -5,13 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
+import os
 
 from flask import Flask
 
 from config import AppConfig
-from services.kairos_scenario_repository import get_persistent_data_dir
 
 from .settings_binding import RuntimeSettings
+
+
+def get_persistent_data_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Horme"
+    return Path.home() / ".horme"
 
 
 @dataclass(frozen=True)

@@ -16,13 +16,11 @@ from zoneinfo import ZoneInfo
 from config import AppConfig, get_app_config
 
 from .apollo_service import ApolloService
-from .kairos_service import KairosService
 from .market_calendar_service import MarketCalendarService
 from .market_data import MarketDataService
 from .open_trade_manager import OpenTradeManager
 from .options_chain_service import OptionsChainService
 from .performance_dashboard_service import build_performance_record, calculate_expectancy, summarize_outcomes
-from .repositories.scenario_repository import KairosBundleRepository
 from .repositories.trade_repository import TradeRepository
 from .runtime.scheduler import RuntimeJobHandle, RuntimeScheduler, ThreadingTimerScheduler
 from .trade_store import JOURNAL_NAME_DEFAULT, current_timestamp, normalize_system_name, parse_date_value
@@ -83,7 +81,7 @@ class TalosService:
     MAX_ACTIVITY_ITEMS = 60
     MAX_SKIP_ITEMS = 60
     MAX_TOTAL_OPEN_TRADES = 4
-    MAX_OPEN_TRADES_PER_SYSTEM = {"Apollo": 3, "Kairos": 1}
+    MAX_OPEN_TRADES_PER_SYSTEM = {"Apollo": 3}
     APOLLO_MAX_PORTFOLIO_POSITIONS = 3
     APOLLO_PREMIUM_TARGET_RATIO = 0.01
     APOLLO_PROJECTED_BLACK_SWAN_LOSS_CAP_RATIO = 0.10
@@ -96,8 +94,7 @@ class TalosService:
         ("Standard", "Aggressive"),
         ("Standard", "Fortress", "Aggressive"),
     )
-    TALOS_KAIROS_ELIGIBLE_MODE_KEYS = {"prime", "window-open", "subprime-improving"}
-    SLOT_ORDER = ("Apollo", "Kairos")
+    SLOT_ORDER = ("Apollo",)
     SCORE_BANDS = (
         (90.0, "Elite", "elite"),
         (80.0, "Strong", "strong"),
@@ -123,21 +120,11 @@ class TalosService:
         "standard_preference": (4.0, 15.0),
         "loss_penalty": (10.0, 30.0),
     }
-    LEARNING_SEGMENTS = (
-        "Apollo_HIGH_VIX",
-        "Apollo_LOW_VIX",
-        "Kairos_HIGH_VIX",
-        "Kairos_LOW_VIX",
-    )
+    LEARNING_SEGMENTS = ("Apollo_HIGH_VIX", "Apollo_LOW_VIX")
     LEARNING_SOURCE_WEIGHTS = {"real": 1.0, "simulated": 0.7, "talos": 1.5}
     LEARNING_MIN_WEIGHTED_TRADES = 3.0
     MAX_WEIGHT_CHANGE_PER_CYCLE = 2.0
     MAX_DECISION_ITEMS = 120
-    KAIROS_CREDIT_OVERRIDE_REASONS = {
-        "Current live candidate is below the minimum credit threshold.",
-        "Current modeled candidate is below the minimum credit threshold.",
-    }
-
     def __init__(
         self,
         *,
@@ -146,7 +133,6 @@ class TalosService:
         options_chain_service: OptionsChainService,
         open_trade_manager: OpenTradeManager,
         config: AppConfig | None = None,
-        scenario_repository: KairosBundleRepository | None = None,
         scheduler: RuntimeScheduler | None = None,
         state_path: str | Path | None = None,
         now_provider=None,
@@ -156,7 +142,6 @@ class TalosService:
         self.market_data_service = market_data_service
         self.options_chain_service = options_chain_service
         self.open_trade_manager = open_trade_manager
-        self.scenario_repository = scenario_repository
         self.scheduler = scheduler or ThreadingTimerScheduler()
         self.display_timezone = ZoneInfo(self.config.app_timezone)
         self.market_calendar_service = MarketCalendarService(self.config)
@@ -309,11 +294,6 @@ class TalosService:
                     open_records,
                     learning_state=dict(state.get("learning_state") or {}),
                 )
-            kairos_action_taken = self._evaluate_slot(state, "Kairos", candidates.get("Kairos"), open_records)
-            if kairos_action_taken:
-                management_payload = self.open_trade_manager.evaluate_open_trades(send_alerts=False)
-                open_records = self._filter_talos_records(management_payload)
-                self._sync_trade_metadata(state, open_records)
             self._refresh_apollo_portfolio_state(state, open_records, existing_plan=apollo_plan)
             self._refresh_runtime_schedule_state(state, reference_time=now)
             if management_changed:
@@ -321,7 +301,6 @@ class TalosService:
                     state,
                     cycle_time=now,
                     apollo_action_taken=apollo_action_taken,
-                    kairos_action_taken=kairos_action_taken,
                 )
 
             state["last_cycle_at"] = now.isoformat()
@@ -653,7 +632,6 @@ class TalosService:
             "pricing_rule": "Simulated entry fill = short bid - long ask. Simulated exit fill = short ask - long bid.",
             "rotation_rule": "Talos only rotates after more than 75% of credit is captured, a replacement candidate is available, and the replacement score is equal or better.",
             "capture_close_rule": f"Talos automatically liquidates any open Talos position once credit captured reaches {self.TALOS_CAPTURE_LIQUIDATION_THRESHOLD:.1f}% or greater.",
-            "kairos_entry_rule": "Talos only opens Kairos when the Kairos tape is favorable and the mode is Prime, Window Open, or Subprime Improving. Talos may override the Kairos minimum credit floor only when that is the sole blocking reason.",
             "apollo_portfolio_rule": "Talos actively builds up to three Apollo positions from the current live state while keeping projected Black Swan loss under 10% of settled balance and using the daily premium target as a scoring objective rather than a gate.",
             "example_record": example_record,
         }
@@ -696,7 +674,6 @@ class TalosService:
         *,
         cycle_time: datetime,
         apollo_action_taken: bool,
-        kairos_action_taken: bool,
     ) -> None:
         next_scan_display = self._format_datetime(state.get("next_scan_at"))
         detail_parts: List[str] = [
@@ -705,19 +682,14 @@ class TalosService:
         opened_systems: List[str] = []
         if apollo_action_taken:
             opened_systems.append("Apollo")
-        if kairos_action_taken:
-            opened_systems.append("Kairos")
         if opened_systems:
             detail_parts.append(f"New {' and '.join(opened_systems)} entry activity was permitted in the same session.")
         else:
             timestamp = cycle_time.isoformat()
             reasons: List[str] = []
             apollo_reason = self._latest_skip_reason_for_system(state, "Apollo", timestamp=timestamp)
-            kairos_reason = self._latest_skip_reason_for_system(state, "Kairos", timestamp=timestamp)
             if apollo_reason:
                 reasons.append(f"Apollo: {apollo_reason}")
-            if kairos_reason:
-                reasons.append(f"Kairos: {kairos_reason}")
             if reasons:
                 detail_parts.append("; ".join(reasons))
             else:
@@ -854,7 +826,7 @@ class TalosService:
 
     def _build_learning_state_payload(self, learning_state: Dict[str, Any]) -> Dict[str, Any]:
         profiles = dict((learning_state or {}).get("profiles") or {})
-        active_segment = str((learning_state or {}).get("active_segment") or "Kairos_LOW_VIX")
+        active_segment = str((learning_state or {}).get("active_segment") or "Apollo_LOW_VIX")
         active_profile = dict(profiles.get(active_segment) or {})
         current_weights = self._normalize_component_weights(active_profile.get("weights"))
         return {
@@ -1694,7 +1666,6 @@ class TalosService:
         governance = self._build_slot_governance(open_records)
         return {
             "Apollo": self._build_apollo_portfolio_plan(account_balance, open_records, learning_state=learning_state) if self._should_evaluate_candidate("Apollo", governance) else None,
-            "Kairos": self._build_kairos_candidate(account_balance) if self._should_evaluate_candidate("Kairos", governance) else None,
         }
 
     def _build_apollo_portfolio_plan(
@@ -2667,134 +2638,6 @@ class TalosService:
             ]
         )
 
-    def _build_kairos_candidate(self, account_balance: float) -> Dict[str, Any] | None:
-        service = KairosService(
-            market_data_service=self.market_data_service,
-            options_chain_service=self.options_chain_service,
-            config=replace(self.config, apollo_account_value=max(account_balance, 1.0)),
-            scenario_repository=self.scenario_repository,
-            trade_store=self.trade_store,
-        )
-        if hasattr(service, "initialize_live_kairos_on_page_load"):
-            dashboard = service.initialize_live_kairos_on_page_load()
-        else:
-            dashboard = service.get_dashboard_payload()
-        best_trade = (dashboard or {}).get("best_trade_override") or {}
-        candidate = best_trade.get("candidate") if isinstance(best_trade, dict) else None
-        if not isinstance(candidate, dict):
-            return None
-        mode_key = str(candidate.get("mode_key") or "").strip().lower()
-        if mode_key not in self.TALOS_KAIROS_ELIGIBLE_MODE_KEYS:
-            return None
-        override_context = self._resolve_talos_kairos_override(best_trade=best_trade, candidate=candidate, dashboard=dashboard)
-        if best_trade.get("status") != "ready" and not override_context["enabled"]:
-            return None
-        mode_label = str(candidate.get("mode_label") or candidate.get("mode_key") or "Kairos").strip() or "Kairos"
-        score_summary = self._score_candidate(
-            system_name="Kairos",
-            candidate_profile=mode_label,
-            vix_value=self._coerce_float((self.market_data_service.get_latest_snapshot("^VIX", query_type="talos_kairos_vix") or {}).get("Latest Value")),
-            em_multiple=self._coerce_float(candidate.get("actual_em_multiple") or candidate.get("daily_move_multiple")),
-            distance_points=self._coerce_float(candidate.get("actual_distance_to_short") or candidate.get("distance_points")),
-            short_delta=self._coerce_float(candidate.get("estimated_short_delta")),
-            expected_move=self._coerce_float(candidate.get("expected_move_used")),
-            credit=self._coerce_float(candidate.get("credit_estimate_dollars")) / 100.0 if self._coerce_float(candidate.get("credit_estimate_dollars")) is not None else None,
-            spread_width=self._coerce_float(candidate.get("spread_width")),
-            max_loss=self._coerce_float(candidate.get("max_loss_dollars")),
-            total_premium=(
-                max(self._coerce_float(candidate.get("conservative_credit_dollars")) or self._coerce_float(candidate.get("credit_estimate_dollars")) or 0.0, 0.0)
-                * float(candidate.get("recommended_contracts") or 1)
-            ),
-            raw_candidate_score=self._coerce_float(candidate.get("fit_score") or candidate.get("score")),
-            structure_context=(dashboard or {}).get("current_structure_status") or (best_trade or {}).get("structure_status"),
-            macro_context=(dashboard or {}).get("current_timing_status") or candidate.get("mode_descriptor"),
-        )
-        spx_snapshot = self.market_data_service.get_latest_snapshot("^GSPC", query_type="talos_kairos_spx") or {}
-        vix_snapshot = self.market_data_service.get_latest_snapshot("^VIX", query_type="talos_kairos_vix") or {}
-        entry_pricing = self._resolve_kairos_entry_pricing(candidate)
-        credit_estimate_dollars = float(candidate.get("credit_estimate_dollars") or 0.0)
-        session_profile = mode_label
-        actual_entry_credit = entry_pricing["actual_entry_credit"]
-        premium_per_contract = round(actual_entry_credit * 100.0, 2)
-        contracts = int(candidate.get("recommended_contracts") or 1)
-        override_note = " Talos credit-floor override." if override_context["enabled"] else ""
-        payload = {
-            "trade_mode": "talos",
-            "system_name": "Kairos",
-            "journal_name": "Horme",
-            "system_version": self._version_number(),
-            "candidate_profile": session_profile,
-            "status": "open",
-            "trade_date": current_timestamp().split("T", 1)[0],
-            "entry_datetime": current_timestamp(),
-            "expiration_date": current_timestamp().split("T", 1)[0],
-            "underlying_symbol": "SPX",
-            "spx_at_entry": spx_snapshot.get("Latest Value") or "",
-            "vix_at_entry": vix_snapshot.get("Latest Value") or "",
-            "structure_grade": session_profile,
-            "macro_grade": "Improving",
-            "expected_move": candidate.get("expected_move_used") or "",
-            "expected_move_used": candidate.get("expected_move_used") or "",
-            "expected_move_source": candidate.get("expected_move_source") or "same_day_atm_straddle",
-            "option_type": "Put Credit Spread",
-            "short_strike": candidate.get("short_strike") or "",
-            "long_strike": candidate.get("long_strike") or "",
-            "spread_width": candidate.get("spread_width") or "",
-            "contracts": contracts,
-            "candidate_credit_estimate": round((credit_estimate_dollars / 100.0), 4) if credit_estimate_dollars else "",
-            "actual_entry_credit": actual_entry_credit,
-            "net_credit_per_contract": actual_entry_credit,
-            "distance_to_short": candidate.get("distance_points") or "",
-            "em_multiple_floor": candidate.get("em_multiple_floor") or "",
-            "percent_floor": candidate.get("percent_floor") or "",
-            "boundary_rule_used": candidate.get("boundary_rule_used") or "",
-            "actual_distance_to_short": candidate.get("actual_distance_to_short") or candidate.get("distance_points") or "",
-            "actual_em_multiple": candidate.get("actual_em_multiple") or candidate.get("daily_move_multiple") or "",
-            "fallback_used": "yes" if candidate.get("fallback_used") else "no",
-            "fallback_rule_name": candidate.get("fallback_rule_name") or "",
-            "short_delta": candidate.get("estimated_short_delta") or "",
-            "pass_type": candidate.get("mode_key") or "",
-            "premium_per_contract": premium_per_contract,
-            "total_premium": round(premium_per_contract * contracts, 2),
-            "max_theoretical_risk": candidate.get("max_loss_dollars") or "",
-            "risk_efficiency": "",
-            "target_em": candidate.get("daily_move_multiple") or "",
-            "notes_entry": self._build_decision_note(
-                system_name="Kairos",
-                descriptor=candidate.get("mode_descriptor") or candidate.get("mode_key") or "candidate",
-                account_balance=account_balance,
-                candidate_score=float(score_summary.get("candidate_score") or 0.0),
-                details=(
-                    f"Kairos state {mode_label}. Tape {override_context['tape_state_label']}. Net credit {actual_entry_credit:.2f}.{override_note} "
-                    f"Distance {candidate.get('distance_points') or 'n/a'} pts; EM {candidate.get('daily_move_multiple') or 'n/a'}x. "
-                    f"Entry fill {entry_pricing['pricing_math_display']}. Talos admits Kairos Prime / Window Open / Subprime Improving candidates in simulation. "
-                    f"{score_summary.get('score_breakdown_display') or ''}"
-                ).strip(),
-            ),
-            "prefill_source": "talos-kairos",
-            "automation_status": "autonomous-entry-and-management",
-            "close_method": "",
-            "close_reason": "",
-            "notes_exit": "",
-        }
-        decision_note = str(payload.get("notes_entry") or "")
-        return {
-            "candidate_score": float(score_summary.get("candidate_score") or 0.0),
-            "decision_note": decision_note,
-            "selection_basis": str(score_summary.get("selection_basis") or ""),
-            "score_breakdown": score_summary,
-            "score_breakdown_display": str(score_summary.get("score_breakdown_display") or ""),
-            "pricing_basis_label": entry_pricing["pricing_basis_label"],
-            "pricing_math_display": entry_pricing["pricing_math_display"],
-            "entry_gate_label": (
-                f"Talos accepts Kairos on {override_context['tape_state_label']} when the mode is Prime, Window Open, or Subprime Improving."
-                f"{' Talos credit-floor override.' if override_context['enabled'] else ''}"
-            ),
-            "credit_floor_override": override_context["enabled"],
-            "override_reason": override_context["reason_text"],
-            "trade_payload": payload,
-        }
-
     def _resolve_apollo_entry_pricing(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         executable_credit = self._coerce_float(candidate.get("executable_credit"))
         if executable_credit is None:
@@ -2812,24 +2655,6 @@ class TalosService:
             "pricing_math_display": pricing_math_display,
         }
 
-    def _resolve_kairos_entry_pricing(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
-        conservative_credit_dollars = self._coerce_float(candidate.get("conservative_credit_dollars"))
-        if conservative_credit_dollars is None:
-            conservative_credit_dollars = max(self._coerce_float(candidate.get("credit_estimate_dollars")) or 0.0, 0.0)
-        conservative_credit_dollars = round(max(conservative_credit_dollars, 0.0), 2)
-        short_bid = self._coerce_float(candidate.get("short_leg_bid"))
-        long_ask = self._coerce_float(candidate.get("long_leg_ask"))
-        actual_entry_credit = round(conservative_credit_dollars / 100.0, 4)
-        if short_bid is not None and long_ask is not None:
-            pricing_math_display = f"short bid {short_bid:.2f} - long ask {long_ask:.2f} = {actual_entry_credit:.2f}"
-        else:
-            pricing_math_display = f"conservative credit {actual_entry_credit:.2f}"
-        return {
-            "actual_entry_credit": actual_entry_credit,
-            "pricing_basis_label": "Conservative executable entry credit",
-            "pricing_math_display": pricing_math_display,
-        }
-
     def _build_decision_note(
         self,
         *,
@@ -2843,32 +2668,6 @@ class TalosService:
             f"Talos auto-entered this {system_name} setup from the {descriptor} slot using account balance {self._format_currency(account_balance)}. "
             f"Score {candidate_score:.1f}. {details} Autonomous management remains enabled."
         )
-
-    def _resolve_talos_kairos_override(
-        self,
-        *,
-        best_trade: Dict[str, Any],
-        candidate: Dict[str, Any],
-        dashboard: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        rejection_reasons = [str(item).strip() for item in (candidate.get("rejection_reasons") or []) if str(item).strip()]
-        timing_status = str((dashboard or {}).get("current_timing_status") or candidate.get("timing_status") or "").strip() or "Unknown"
-        structure_status = str((dashboard or {}).get("current_structure_status") or candidate.get("structure_status") or "").strip() or "Unknown"
-        mode_label = str(candidate.get("mode_label") or candidate.get("mode_key") or "Kairos").strip()
-        tape_state_label = f"{mode_label} | timing {timing_status} | structure {structure_status}"
-        only_credit_floor_blocks = bool(rejection_reasons) and set(rejection_reasons).issubset(self.KAIROS_CREDIT_OVERRIDE_REASONS)
-        tape_is_green = timing_status == "Eligible" and structure_status in {"Bullish Confirmation", "Developing", "Prime"}
-        enabled = best_trade.get("status") != "ready" and only_credit_floor_blocks and tape_is_green
-        reason_text = (
-            f"{tape_state_label}; net credit {self._coerce_float(candidate.get('conservative_credit_dollars')) or self._coerce_float(candidate.get('credit_estimate_dollars')) or 0.0:.2f}; Talos credit-floor override"
-            if enabled
-            else tape_state_label
-        )
-        return {
-            "enabled": enabled,
-            "tape_state_label": tape_state_label,
-            "reason_text": reason_text,
-        }
 
     def _compute_account_balance(self, open_records: List[Dict[str, Any]]) -> float:
         return self._compute_balance_components(open_records)["settled_balance"]
@@ -2925,7 +2724,7 @@ class TalosService:
             "decision_log": [],
             "skip_log": [],
             "apollo_portfolio_state": {},
-            "learning_state": {"active_segment": "Kairos_LOW_VIX", "profiles": {}, "records": [], "last_refreshed_at": ""},
+            "learning_state": {"active_segment": "Apollo_LOW_VIX", "profiles": {}, "records": [], "last_refreshed_at": ""},
             "trade_metadata": {},
         }
 
@@ -3500,9 +3299,9 @@ class TalosService:
             else:
                 metrics["weights"] = self._default_component_weights()
             profiles[segment] = metrics
-        active_segment = str((learning_state or {}).get("active_segment") or "Kairos_LOW_VIX")
+        active_segment = str((learning_state or {}).get("active_segment") or "Apollo_LOW_VIX")
         state["learning_state"] = {
-            "active_segment": active_segment if active_segment in profiles else "Kairos_LOW_VIX",
+            "active_segment": active_segment if active_segment in profiles else "Apollo_LOW_VIX",
             "profiles": profiles,
             "records": learning_records,
             "last_refreshed_at": self._now().isoformat(),
@@ -3517,7 +3316,7 @@ class TalosService:
                 if status in {"open", "reduced"}:
                     continue
                 system_name = normalize_system_name(trade.get("system_name"))
-                if system_name not in {"Apollo", "Kairos"}:
+                if system_name != "Apollo":
                     continue
                 vix_value = self._coerce_float(trade.get("vix_at_entry"))
                 records.append(
@@ -3850,10 +3649,6 @@ class TalosService:
         return min(1.0, gross_pnl / max_loss)
 
     def _fit_score(self, *, system_name: str, structure_context: Any, macro_context: Any) -> float:
-        if system_name == "Kairos":
-            structure_score = self._qualitative_score(structure_context, good_terms=("bullish", "confirm", "developing", "improving", "prime"), poor_terms=("failed", "weakening", "expired", "broken"), neutral=0.6)
-            macro_score = self._qualitative_score(macro_context, good_terms=("prime", "window-open", "improving", "ready"), poor_terms=("late", "weak", "failed"), neutral=0.65)
-            return min(1.0, (0.65 * structure_score) + (0.35 * macro_score))
         structure_score = self._qualitative_score(structure_context, good_terms=("good", "allowed", "healthy", "balanced"), poor_terms=("poor", "stand aside", "blocked", "risk-off"), neutral=0.65)
         macro_score = self._qualitative_score(macro_context, good_terms=("none", "minor", "neutral"), poor_terms=("major", "high", "blocked", "risk"), neutral=0.6)
         return min(1.0, (0.7 * structure_score) + (0.3 * macro_score))
