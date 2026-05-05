@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from flask import Flask, abort, current_app, g, has_app_context, has_request_context, jsonify, redirect, render_template, request, url_for
+from flask import Flask, abort, current_app, g, has_app_context, has_request_context, jsonify, redirect, render_template, request, session, url_for
 
 from config import (
     AppConfig,
@@ -679,6 +679,39 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
         return redirect(url_for("index"))
 
+    @app.post("/logout")
+    def logout() -> Any:
+        provider = getattr(market_data_service, "provider", None)
+        auth_service = getattr(provider, "auth_service", None)
+        token_clear_failed = False
+        if auth_service is not None and hasattr(auth_service, "clear_tokens"):
+            try:
+                auth_service.clear_tokens()
+            except Exception as exc:  # pragma: no cover - defensive cleanup guard
+                token_clear_failed = True
+                app.logger.warning("Unable to clear Schwab tokens during logout: %s", exc)
+
+        session.clear()
+        oauth_session_keys = app.extensions["oauth_session_keys"]
+        workflow_state = get_workflow_state(app)
+        workflow_state.put(oauth_session_keys["login_in_progress"], False)
+        workflow_state.put(oauth_session_keys["callback_pending"], False)
+        workflow_state.put(oauth_session_keys["connected"], False)
+        workflow_state.put(oauth_session_keys["authorized"], False)
+        set_status_message(
+            "Session reset. Schwab has been disconnected." if not token_clear_failed else "Session reset, but Schwab token cleanup failed.",
+            level="warning" if token_clear_failed else "info",
+        )
+
+        response = redirect(url_for("index"))
+        session_invalidator = getattr(app.extensions.get("service_bundle"), "session_invalidator", None)
+        if session_invalidator is not None:
+            try:
+                session_invalidator.invalidate_response(response)
+            except Exception as exc:  # pragma: no cover - defensive cleanup guard
+                app.logger.warning("Unable to invalidate session response during logout: %s", exc)
+        return response
+
     @app.get("/journal")
     def journal_dashboard() -> Any:
         return trade_dashboard("real")
@@ -1335,6 +1368,7 @@ def build_delphi_route_map() -> Dict[str, str]:
         "journal_simulated": url_for("trade_dashboard", trade_mode="simulated"),
         "open_trades": url_for("open_trade_management_page"),
         "notifications": url_for("open_trade_management_page"),
+        "logout": url_for("logout"),
         "performance_data": url_for("performance_dashboard_data"),
         "text_status": url_for("text_status_api"),
     }

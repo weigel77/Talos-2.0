@@ -3,7 +3,7 @@
     <a class="button-link{% if secondary %} button-link-secondary{% endif %}{% if is_active %} button-link-active{% endif %}" href="{{ href }}" data-delphi-nav="{{ key }}"{% if is_active %} aria-current="page"{% endif %}{% if key == 'apollo' %} data-refresh-market-status="true"{% endif %}>{{ label }}</a>
 {%- endmacro %}
 
-{% macro render_delphi_header(active_page, page_heading, page_copy, page_kicker='TALOS 2.0.2', page_meta='Talos workflow shell.', page_version='TALOS 2.0.2', header_variant='subpage', menu_status=None) -%}
+{% macro render_delphi_header(active_page, page_heading, page_copy, page_kicker='', page_meta='Talos workflow shell.', page_version='', header_variant='subpage', menu_status=None) -%}
     {% set routes = delphi_routes if delphi_routes is defined and delphi_routes else {} %}
     {% set header_icons = {} %}
     {% set header_icon = header_icons.get(active_page) %}
@@ -81,6 +81,9 @@
                     <p class="subtle">{{ page_meta }}</p>
                     <div class="delphi-header-actions">
                         <a class="button-link button-link-secondary button-link-small" href="{{ routes.get('notifications') }}">Notifications</a>
+                        <form method="post" action="{{ routes.get('logout', url_for('logout')) }}" class="delphi-header-logout-form">
+                            <button type="submit" class="button-link button-link-secondary button-link-small">Logout</button>
+                        </form>
                         <button
                             type="button"
                             class="button-link button-link-secondary button-link-small"

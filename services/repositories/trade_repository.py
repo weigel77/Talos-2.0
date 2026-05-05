@@ -152,6 +152,7 @@ class MirroredTradeRepository:
     def initialize(self) -> None:
         self._local_repository.initialize()
         self._remote_repository.initialize()
+        self._hydrate_local_read_model_from_remote()
 
     def next_trade_number(self) -> int:
         try:
@@ -220,6 +221,19 @@ class MirroredTradeRepository:
 
     def build_real_trade_outcome_profile(self) -> Dict[str, Any]:
         return self._local_repository.build_real_trade_outcome_profile()
+
+    def _hydrate_local_read_model_from_remote(self) -> None:
+        try:
+            from services.local_trade_sync_service import sync_hosted_trade_journal_to_local
+
+            sync_hosted_trade_journal_to_local(
+                hosted_repository=self._remote_repository,
+                local_repository=self._local_repository,
+                trade_modes=("real", "simulated", "talos"),
+                replace_local_state=False,
+            )
+        except Exception as exc:  # pragma: no cover - defensive mirror hydration guard
+            LOGGER.warning("Unable to hydrate local trade mirror from Supabase: %s", exc)
 
     def _require_local_trade(self, trade_id: int) -> Dict[str, Any]:
         trade = self._local_repository.get_trade(trade_id)
