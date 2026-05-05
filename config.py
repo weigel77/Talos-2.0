@@ -17,7 +17,7 @@ HOSTED_RUNTIME_PORT = 5015
 HOSTED_RUNTIME_BASE_URL = f"http://{HOSTED_RUNTIME_HOST}:{HOSTED_RUNTIME_PORT}"
 HOSTED_PRODUCTION_PUBLIC_BASE_URL = "https://eigeltrade.com"
 HOSTED_PRODUCTION_CALLBACK_URL = f"{HOSTED_PRODUCTION_PUBLIC_BASE_URL}/callback"
-HOSTED_APP_VERSION = "2.0.1"
+HOSTED_APP_VERSION = "2.1.0"
 HOSTED_APP_DISPLAY_NAME = f"Talos {HOSTED_APP_VERSION}"
 HOSTED_APP_PAGE_KICKER = f"TALOS {HOSTED_APP_VERSION}"
 HOSTED_APP_VERSION_LABEL = f"TALOS {HOSTED_APP_VERSION}"
@@ -39,9 +39,9 @@ class AppConfig:
     hosted_refresh_token_cookie_name: str = "delphi_hosted_refresh_token"
     app_host: str = "127.0.0.1"
     app_port: int = 5015
-    app_display_name: str = "Talos 2.0.1"
-    app_page_kicker: str = "TALOS 2.0.1"
-    app_version_label: str = "TALOS 2.0.1"
+    app_display_name: str = "Talos 2.0.2"
+    app_page_kicker: str = "TALOS 2.0.2"
+    app_version_label: str = "TALOS 2.0.2"
     session_cookie_name: str = "delphi5_hosted_session"
     oauth_session_namespace: str = "delphi5hosted"
     kairos_replay_storage_dir: str = ""
@@ -93,9 +93,9 @@ class AppConfig:
             or "delphi_hosted_refresh_token",
             app_host=os.getenv("APP_HOST", "127.0.0.1").strip() or "127.0.0.1",
             app_port=int(os.getenv("APP_PORT", "5015").strip() or "5015"),
-            app_display_name=os.getenv("APP_DISPLAY_NAME", "Talos 2.0.1").strip() or "Talos 2.0.1",
-            app_page_kicker=os.getenv("APP_PAGE_KICKER", "TALOS 2.0.1").strip() or "TALOS 2.0.1",
-            app_version_label=os.getenv("APP_VERSION_LABEL", "TALOS 2.0.1").strip() or "TALOS 2.0.1",
+            app_display_name=os.getenv("APP_DISPLAY_NAME", "Talos 2.0.2").strip() or "Talos 2.0.2",
+            app_page_kicker=os.getenv("APP_PAGE_KICKER", "TALOS 2.0.2").strip() or "TALOS 2.0.2",
+            app_version_label=os.getenv("APP_VERSION_LABEL", "TALOS 2.0.2").strip() or "TALOS 2.0.2",
             session_cookie_name=os.getenv("SESSION_COOKIE_NAME", "delphi5_hosted_session").strip() or "delphi5_hosted_session",
             oauth_session_namespace=os.getenv("OAUTH_SESSION_NAMESPACE", "delphi5hosted").strip().lower() or "delphi5hosted",
             kairos_replay_storage_dir=os.getenv("KAIROS_REPLAY_STORAGE_DIR", "").strip(),

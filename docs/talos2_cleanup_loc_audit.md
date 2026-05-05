@@ -105,3 +105,165 @@ This pre-pass baseline uses the same exclusions as the original audit: `.git`, `
 
 - Kairos runtime/services, Kairos tests, Delphi4 sync code, and most legacy validation scripts were physically deleted in this pass.
 - The repository is materially smaller, but it is still above the requested ~20k LOC target because large hosted/mobile/static/template surfaces remain in `app.py`, `templates`, and `static`.
+
+## Talos 2.1 Pre-Prune Snapshot
+
+- Date: 2026-05-05
+- Pre-pass commit: `6fb4016bcbc70c8311733a3fb7669f2c2795d84b`
+
+### Working Tree Status (Before Edits)
+
+Modified:
+
+- app.py
+- config.py
+- instance/apollo_last_run.json
+- instance/horme_trades.db
+- services/open_trade_manager.py
+- services/runtime/service_composition.py
+- static/styles.css
+- templates/_delphi_header_macros.html
+
+Deleted:
+
+- services/talos_service.py
+- static/hosted_shell.js
+- templates/_hosted_mobile_bottom_nav.html
+- templates/home.html
+- templates/hosted_device_launch.html
+- templates/hosted_login.html
+- templates/hosted_login_mobile.html
+- templates/hosted_mobile_apollo.html
+- templates/hosted_mobile_shell.html
+- templates/hosted_shell_access_error.html
+- templates/hosted_shell_apollo.html
+- templates/hosted_shell_base.html
+- templates/hosted_shell_home.html
+- templates/hosted_shell_journal.html
+- templates/hosted_shell_manage_trades.html
+- templates/hosted_shell_open_trades.html
+- templates/hosted_shell_performance.html
+- templates/hosted_shell_placeholder.html
+- templates/performance_summary.html
+- templates/talos.html
+
+### LOC Baseline By Category
+
+- Python LOC: 20,755
+- Templates LOC: 3,552
+- CSS LOC: 7,441
+- JS LOC: 261
+- Tests LOC: 95
+- Static text/code assets LOC: 7,871
+
+### Top 15 LOC Files
+
+| LOC | File |
+| ---: | --- |
+| 7,441 | static/styles.css |
+| 3,213 | app.py |
+| 2,403 | services/trade_store.py |
+| 1,852 | services/apollo_candidate_service.py |
+| 1,573 | services/open_trade_manager.py |
+| 1,530 | templates/performance.html |
+| 1,482 | services/performance_dashboard_service.py |
+| 948 | services/providers/schwab_provider.py |
+| 929 | templates/trades.html |
+| 818 | services/repositories/trade_repository.py |
+| 718 | templates/index.html |
+| 707 | services/apollo_structure_service.py |
+| 534 | services/market_data.py |
+| 496 | services/macro_service.py |
+| 493 | services/repositories/management_state_repository.py |
+
+## Talos 2.1.0 Post-Prune Snapshot
+
+- Date: 2026-05-05
+- Version: 2.1.0
+- Validation: `pytest tests/ -q` → 6 passed
+
+### LOC By Category
+
+| Category | LOC |
+| --- | ---: |
+| Python | 20,361 |
+| Templates | 3,475 |
+| CSS | 6,077 |
+| JS | 261 |
+| Scripts / Docs | 616 |
+| **Total source** | **30,790** |
+
+### Net LOC Reduction vs Pre-Prune Baseline
+
+| Metric | Value |
+| --- | ---: |
+| Pre-prune source LOC | 32,104 |
+| Post-prune source LOC | 30,790 |
+| Net delta (this pass) | −1,314 |
+
+### Major Folder Breakdown
+
+| Folder | LOC |
+| --- | ---: |
+| services | 16,707 |
+| static | 6,338 |
+| templates | 3,475 |
+| app.py | 2,819 |
+| scripts | 665 |
+| supabase | 230 |
+| README.md | 182 |
+| docs | 139 |
+| config.py | 133 |
+| tests | 95 |
+
+### Top 15 LOC Files
+
+| LOC | File |
+| ---: | --- |
+| 6,077 | static/styles.css |
+| 2,819 | app.py |
+| 2,403 | services/trade_store.py |
+| 1,852 | services/apollo_candidate_service.py |
+| 1,573 | services/open_trade_manager.py |
+| 1,530 | templates/performance.html |
+| 1,482 | services/performance_dashboard_service.py |
+| 948 | services/providers/schwab_provider.py |
+| 929 | templates/trades.html |
+| 818 | services/repositories/trade_repository.py |
+| 718 | templates/index.html |
+| 707 | services/apollo_structure_service.py |
+| 534 | services/market_data.py |
+| 496 | services/macro_service.py |
+| 493 | services/repositories/management_state_repository.py |
+
+### Files Deleted In This Pass
+
+| File | Lines Removed |
+| --- | ---: |
+| services/talos_service.py | 3,724 |
+| templates/talos.html | 649 |
+| templates/hosted_mobile_shell.html | 585 |
+| static/hosted_shell.js | 411 |
+| templates/performance_summary.html | 147 |
+| templates/hosted_login.html | 156 |
+| templates/hosted_login_mobile.html | 154 |
+| templates/hosted_mobile_apollo.html | 135 |
+| templates/home.html | 117 |
+| templates/hosted_shell_open_trades.html | 71 |
+| templates/hosted_shell_manage_trades.html | 62 |
+| templates/hosted_shell_journal.html | 64 |
+| templates/hosted_shell_home.html | 64 |
+| templates/hosted_shell_apollo.html | 86 |
+| templates/notifications_settings.html | 82 |
+| templates/hosted_shell_base.html | 48 |
+| templates/hosted_device_launch.html | 49 |
+| templates/hosted_shell_performance.html | 46 |
+| templates/hosted_shell_access_error.html | 22 |
+| templates/hosted_shell_placeholder.html | 19 |
+| templates/_hosted_mobile_bottom_nav.html | 14 |
+
+### Key Removals In This Pass
+
+- **app.py**: ~160 lines removed — dead helpers (`build_mobile_performance_ui_filters`, `build_open_trade_action_payload`, `format_loss_range`, `coerce_trade_notification_input`, `coerce_global_notification_settings_input`), broken route reference fixed in `build_delphi_route_map()`, dead imports removed (`dataclass`, `PERFORMANCE_DEFAULT_FILTERS`, entire `trade_notifications` import block)
+- **static/styles.css**: ~1,364 lines removed — hosted-shell CSS block, top-level kairos blocks, residual kairos selector stubs from media queries, dead utility classes (`.eyebrow`, `.provider-strip`, `.provider-value`, `.provider-sub`, `.full-width`, `.export-actions`)
+- **config.py**: Version bumped `2.0.2` → `2.1.0`

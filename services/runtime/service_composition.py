@@ -15,7 +15,6 @@ from services.options_chain_service import OptionsChainService
 from services.performance_dashboard_service import PerformanceDashboardService
 from services.performance_engine import PerformanceEngine
 from services.pushover_service import PushoverService
-from services.talos_service import NoopTalosService, TalosService
 from services.repositories.apollo_snapshot_repository import ApolloSnapshotRepository, JsonFileApolloSnapshotRepository
 from services.repositories.import_preview_repository import FileSystemImportPreviewRepository, ImportPreviewRepository
 from services.repositories.management_state_repository import OpenTradeManagementStateRepository
@@ -51,7 +50,6 @@ class RuntimeServiceBundle:
     performance_service: PerformanceDashboardService
     performance_engine: PerformanceEngine
     open_trade_manager: OpenTradeManager
-    talos_service: Any
     runtime_components: list[RuntimeComponent]
 
 
@@ -129,29 +127,11 @@ class LocalRuntimeServiceComposer:
             scheduler=runtime_scheduler,
         )
         open_trade_manager.initialize()
-        if self.config.runtime_target == "local":
-            talos_service = TalosService(
-                trade_store=trade_store,
-                market_data_service=market_data_service,
-                options_chain_service=apollo_service.options_chain_service,
-                open_trade_manager=open_trade_manager,
-                config=self.config,
-                scheduler=runtime_scheduler,
-                state_path=storage.instance_path / "talos_state.json",
-            )
-            talos_service.initialize()
-        else:
-            talos_service = NoopTalosService()
         runtime_components = [
             RuntimeComponent(
                 name="open_trade_manager",
                 startup=open_trade_manager.start_background_monitoring,
                 shutdown=open_trade_manager.shutdown,
-            ),
-            RuntimeComponent(
-                name="talos_service",
-                startup=(None if app.testing else talos_service.start_background_monitoring),
-                shutdown=talos_service.shutdown,
             ),
         ]
         return RuntimeServiceBundle(
@@ -172,7 +152,6 @@ class LocalRuntimeServiceComposer:
             performance_service=performance_service,
             performance_engine=performance_engine,
             open_trade_manager=open_trade_manager,
-            talos_service=talos_service,
             runtime_components=runtime_components,
         )
 

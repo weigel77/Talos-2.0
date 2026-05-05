@@ -3,16 +3,10 @@
     <a class="button-link{% if secondary %} button-link-secondary{% endif %}{% if is_active %} button-link-active{% endif %}" href="{{ href }}" data-delphi-nav="{{ key }}"{% if is_active %} aria-current="page"{% endif %}{% if key == 'apollo' %} data-refresh-market-status="true"{% endif %}>{{ label }}</a>
 {%- endmacro %}
 
-{% macro render_delphi_header(active_page, page_heading, page_copy, page_kicker='TALOS 2.0.1', page_meta='Talos workflow shell.', page_version='TALOS 2.0.1', header_variant='subpage', menu_status=None) -%}
+{% macro render_delphi_header(active_page, page_heading, page_copy, page_kicker='TALOS 2.0.2', page_meta='Talos workflow shell.', page_version='TALOS 2.0.2', header_variant='subpage', menu_status=None) -%}
     {% set routes = delphi_routes if delphi_routes is defined and delphi_routes else {} %}
-    {% set header_icons = {
-        'management': 'icons/delphi-icon.png',
-        'apollo': 'icons/apollo-icon.png',
-        'journal': 'icons/journal-icon.png',
-        'performance': 'icons/performance-icon.png',
-    } %}
+    {% set header_icons = {} %}
     {% set header_icon = header_icons.get(active_page) %}
-    <img class="delphi-header-backdrop-image" src="{{ url_for('static', filename='delphi-hero.svg') }}" alt="" aria-hidden="true">
     <div class="delphi-header-backdrop"></div>
     <div class="delphi-header-content">
         <div class="delphi-header-top">
@@ -41,7 +35,7 @@
                     </div>
                 {% endif %}
                 <div>
-                    <p class="hero-kicker delphi-header-kicker">{{ app_identity.page_kicker if hosted_mode or page_kicker in ['Delphi 2.0', 'Delphi', 'Delphi 4.3 Dev', 'Delphi 6.4 Local', 'Delphi 7.0 Local', 'Delphi 7.1 Local', 'Delphi 8.0 Local', 'Delphi 8.0.7 Local'] else page_kicker }}</p>
+                    <p class="hero-kicker delphi-header-kicker">{{ app_identity.page_kicker if hosted_mode else page_kicker }}</p>
                     <h1>{{ page_heading }}</h1>
                     <p class="hero-copy delphi-header-copy">{{ page_copy }}</p>
                 </div>
@@ -68,7 +62,7 @@
             {% endif %}
 
             <div class="delphi-header-meta{% if hosted_mode %} delphi-header-meta-hosted{% endif %}">
-                <span class="hero-version">{{ app_identity.version_label if hosted_mode or page_version in ['Version 2.0', 'Version 4.3 Dev', 'Version 6.4', 'Version 7.0', 'Version 7.1', 'Version 8.0', 'Version 8.0.7'] else page_version }}</span>
+                <span class="hero-version">{{ app_identity.version_label if hosted_mode else page_version }}</span>
                 {% if hosted_mode %}
                     <div class="delphi-header-actions">
                         <a class="button-link button-link-secondary button-link-small" href="{{ routes.get('notifications') }}">Notifications</a>

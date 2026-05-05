@@ -37,6 +37,7 @@ from .trade_notifications import (
 )
 from .trade_store import (
     current_timestamp,
+    is_retained_trade_system,
     parse_date_value,
     parse_datetime_value,
     resolve_trade_candidate_profile,
@@ -887,6 +888,7 @@ class OpenTradeManager:
                 trade
                 for trade in self.trade_store.list_trades(trade_mode)
                 if str(trade.get("derived_status_raw") or trade.get("status") or "").strip().lower() in {"open", "reduced"}
+                and is_retained_trade_system(trade)
             )
         return rows
 
