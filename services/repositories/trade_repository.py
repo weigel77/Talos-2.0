@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, List, Protocol, runtime_checkable
 
 from services.trade_store import TradeStore
@@ -141,9 +143,15 @@ class SQLiteTradeRepository:
 class MirroredTradeRepository:
     """Local journal repository that mirrors writes into Supabase while serving local runtime reads from SQLite."""
 
+    MIRROR_READ_SYNC_TTL_SECONDS = 20
+    MIRROR_READ_SYNC_RETRY_BACKOFF_SECONDS = 30
+
     def __init__(self, *, local_repository: TradeRepository, remote_repository: TradeRepository) -> None:
         self._local_repository = local_repository
         self._remote_repository = remote_repository
+        self._sync_lock = RLock()
+        self._last_read_hydrate_ts = 0.0
+        self._last_read_hydrate_failure_ts = 0.0
 
     @property
     def database_path(self) -> str:
@@ -152,7 +160,7 @@ class MirroredTradeRepository:
     def initialize(self) -> None:
         self._local_repository.initialize()
         self._remote_repository.initialize()
-        self._hydrate_local_read_model_from_remote()
+        self._hydrate_local_read_model_from_remote(force=True)
 
     def next_trade_number(self) -> int:
         try:
@@ -167,45 +175,52 @@ class MirroredTradeRepository:
         return self._local_repository.find_recent_duplicate(values, window_seconds=window_seconds)
 
     def create_trade(self, values: Dict[str, Any]) -> int:
-        remote_payload = dict(values)
-        remote_trade_id = self._remote_repository.create_trade(remote_payload)
-        remote_trade = self._remote_repository.get_trade(remote_trade_id) or {**remote_payload, "id": remote_trade_id}
-        return self._upsert_local_from_remote(remote_trade)
+        with self._sync_lock:
+            remote_payload = dict(values)
+            remote_trade_id = self._remote_repository.create_trade(remote_payload)
+            remote_trade = self._remote_repository.get_trade(remote_trade_id) or {**remote_payload, "id": remote_trade_id}
+            return self._upsert_local_from_remote(remote_trade)
 
     def get_trade(self, trade_id: int) -> Dict[str, Any] | None:
+        self._hydrate_local_read_model_from_remote()
         return self._local_repository.get_trade(trade_id)
 
     def get_trade_by_number(self, trade_number: int) -> Dict[str, Any] | None:
+        self._hydrate_local_read_model_from_remote()
         return self._local_repository.get_trade_by_number(trade_number)
 
     def update_trade(self, trade_id: int, values: Dict[str, Any]) -> None:
-        local_trade = self._require_local_trade(trade_id)
-        remote_trade = self._ensure_remote_trade_for_local_trade(local_trade)
-        remote_values = self._translate_close_event_ids_for_remote(local_trade, remote_trade, values)
-        self._remote_repository.update_trade(int(remote_trade["id"]), remote_values)
-        refreshed_remote_trade = self._remote_repository.get_trade(int(remote_trade["id"])) or remote_trade
-        self._synchronize_local_trade(trade_id, refreshed_remote_trade)
+        with self._sync_lock:
+            local_trade = self._require_local_trade(trade_id)
+            remote_trade = self._ensure_remote_trade_for_local_trade(local_trade)
+            remote_values = self._translate_close_event_ids_for_remote(local_trade, remote_trade, values)
+            self._remote_repository.update_trade(int(remote_trade["id"]), remote_values)
+            refreshed_remote_trade = self._remote_repository.get_trade(int(remote_trade["id"])) or remote_trade
+            self._synchronize_local_trade(trade_id, refreshed_remote_trade)
 
     def delete_trade(self, trade_id: int) -> None:
-        local_trade = self._require_local_trade(trade_id)
-        remote_trade = self._find_remote_trade_by_number(local_trade.get("trade_number"))
-        if remote_trade is not None:
-            self._remote_repository.delete_trade(int(remote_trade["id"]))
-        self._local_repository.delete_trade(trade_id)
+        with self._sync_lock:
+            local_trade = self._require_local_trade(trade_id)
+            remote_trade = self._find_remote_trade_by_number(local_trade.get("trade_number"))
+            if remote_trade is not None:
+                self._remote_repository.delete_trade(int(remote_trade["id"]))
+            self._local_repository.delete_trade(trade_id)
 
     def reduce_trade(self, trade_id: int, values: Dict[str, Any]) -> None:
-        local_trade = self._require_local_trade(trade_id)
-        remote_trade = self._ensure_remote_trade_for_local_trade(local_trade)
-        self._remote_repository.reduce_trade(int(remote_trade["id"]), values)
-        refreshed_remote_trade = self._remote_repository.get_trade(int(remote_trade["id"])) or remote_trade
-        self._synchronize_local_trade(trade_id, refreshed_remote_trade)
+        with self._sync_lock:
+            local_trade = self._require_local_trade(trade_id)
+            remote_trade = self._ensure_remote_trade_for_local_trade(local_trade)
+            self._remote_repository.reduce_trade(int(remote_trade["id"]), values)
+            refreshed_remote_trade = self._remote_repository.get_trade(int(remote_trade["id"])) or remote_trade
+            self._synchronize_local_trade(trade_id, refreshed_remote_trade)
 
     def expire_trade(self, trade_id: int, values: Dict[str, Any]) -> None:
-        local_trade = self._require_local_trade(trade_id)
-        remote_trade = self._ensure_remote_trade_for_local_trade(local_trade)
-        self._remote_repository.expire_trade(int(remote_trade["id"]), values)
-        refreshed_remote_trade = self._remote_repository.get_trade(int(remote_trade["id"])) or remote_trade
-        self._synchronize_local_trade(trade_id, refreshed_remote_trade)
+        with self._sync_lock:
+            local_trade = self._require_local_trade(trade_id)
+            remote_trade = self._ensure_remote_trade_for_local_trade(local_trade)
+            self._remote_repository.expire_trade(int(remote_trade["id"]), values)
+            refreshed_remote_trade = self._remote_repository.get_trade(int(remote_trade["id"])) or remote_trade
+            self._synchronize_local_trade(trade_id, refreshed_remote_trade)
 
     def find_duplicate_trade(self, values: Dict[str, Any]) -> Dict[str, Any] | None:
         duplicate = self._remote_repository.find_duplicate_trade(values)
@@ -214,26 +229,48 @@ class MirroredTradeRepository:
         return self._local_repository.find_duplicate_trade(values)
 
     def list_trades(self, trade_mode: str) -> List[Dict[str, Any]]:
+        self._hydrate_local_read_model_from_remote()
         return self._local_repository.list_trades(trade_mode)
 
     def summarize(self, trade_mode: str) -> Dict[str, Any]:
+        self._hydrate_local_read_model_from_remote()
         return self._local_repository.summarize(trade_mode)
 
     def build_real_trade_outcome_profile(self) -> Dict[str, Any]:
+        self._hydrate_local_read_model_from_remote()
         return self._local_repository.build_real_trade_outcome_profile()
 
-    def _hydrate_local_read_model_from_remote(self) -> None:
-        try:
-            from services.local_trade_sync_service import sync_hosted_trade_journal_to_local
+    def _hydrate_local_read_model_from_remote(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force:
+            if (now - self._last_read_hydrate_ts) < self.MIRROR_READ_SYNC_TTL_SECONDS:
+                return
+            if self._last_read_hydrate_failure_ts and (now - self._last_read_hydrate_failure_ts) < self.MIRROR_READ_SYNC_RETRY_BACKOFF_SECONDS:
+                return
 
-            sync_hosted_trade_journal_to_local(
-                hosted_repository=self._remote_repository,
-                local_repository=self._local_repository,
-                trade_modes=("real", "simulated", "talos"),
-                replace_local_state=False,
-            )
-        except Exception as exc:  # pragma: no cover - defensive mirror hydration guard
-            LOGGER.warning("Unable to hydrate local trade mirror from Supabase: %s", exc)
+        with self._sync_lock:
+            now = time.monotonic()
+            if not force:
+                if (now - self._last_read_hydrate_ts) < self.MIRROR_READ_SYNC_TTL_SECONDS:
+                    return
+                if self._last_read_hydrate_failure_ts and (now - self._last_read_hydrate_failure_ts) < self.MIRROR_READ_SYNC_RETRY_BACKOFF_SECONDS:
+                    return
+
+            try:
+                from services.local_trade_sync_service import sync_hosted_trade_journal_to_local
+
+                for mode in ("real", "simulated", "talos"):
+                    sync_hosted_trade_journal_to_local(
+                        hosted_repository=self._remote_repository,
+                        local_repository=self._local_repository,
+                        trade_modes=(mode,),
+                        replace_local_state=True,
+                    )
+                self._last_read_hydrate_ts = now
+                self._last_read_hydrate_failure_ts = 0.0
+            except Exception as exc:  # pragma: no cover - defensive mirror hydration guard
+                self._last_read_hydrate_failure_ts = now
+                LOGGER.warning("Unable to hydrate local trade mirror from Supabase: %s", exc)
 
     def _require_local_trade(self, trade_id: int) -> Dict[str, Any]:
         trade = self._local_repository.get_trade(trade_id)

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page_browser_title }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page-shell hosted-launch-shell">
+        <section class="hero-card delphi-header-card hosted-launch-card">
+            <div class="delphi-header-backdrop"></div>
+            <div class="delphi-header-content">
+                <div class="delphi-header-top">
+                    <div class="delphi-header-brand">
+                        <div>
+                            <p class="hero-kicker">{{ app_identity.page_kicker }}</p>
+                            <h1>Choose Your Hosted View</h1>
+                            <p class="hero-copy delphi-header-copy">Open the Talos hosted surface in the layout that matches this device. Desktop lands on the full management shell. Mobile opens the phone-first shell.</p>
+                        </div>
+                    </div>
+                    <div class="delphi-header-meta delphi-header-meta-hosted">
+                        <span class="hero-version">{{ app_identity.version_label }}</span>
+                        <p class="subtle">Authenticated: {{ 'Yes' if authenticated else 'No' }}</p>
+                        <p class="subtle">Preferred view: {{ preferred_view or 'auto' }}</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="hosted-shell-panel hosted-launch-panel">
+            <div class="hosted-shell-panel-header">
+                <div>
+                    <h2>Launch Talos Hosted</h2>
+                    <p class="hosted-shell-subtle">Use the direct links below or let the page route automatically based on your selected view and screen width.</p>
+                </div>
+            </div>
+            <div class="hosted-shell-summary-grid">
+                <article class="hosted-shell-summary-card">
+                    <p>Desktop</p>
+                    <strong>Full shell</strong>
+                    <a class="button-link" href="{{ desktop_target }}">Open Desktop</a>
+                </article>
+                <article class="hosted-shell-summary-card">
+                    <p>Mobile</p>
+                    <strong>Phone shell</strong>
+                    <a class="button-link" href="{{ mobile_target }}">Open Mobile</a>
+                </article>
+            </div>
+            <p class="subtle">If automatic routing does not trigger, use the buttons above. Desktop home: {{ desktop_home_url }}. Mobile home: {{ mobile_home_url }}.</p>
+        </section>
+    </main>
+
+    <script>
+        (() => {
+            const preferredView = {{ preferred_view|tojson }};
+            const explicitView = {{ explicit_view|tojson }};
+            const desktopTarget = {{ desktop_target|tojson }};
+            const mobileTarget = {{ mobile_target|tojson }};
+            const mobileBreakpoint = Number({{ mobile_breakpoint|tojson }} || 768);
+            const pickTarget = () => {
+                if (explicitView === 'desktop') return desktopTarget;
+                if (explicitView === 'mobile') return mobileTarget;
+                if (preferredView === 'desktop') return desktopTarget;
+                if (preferredView === 'mobile') return mobileTarget;
+                return window.innerWidth < mobileBreakpoint ? mobileTarget : desktopTarget;
+            };
+            const target = pickTarget();
+            if (target) {
+                window.location.replace(target);
+            }
+        })();
+    </script>
+</body>
+</html>

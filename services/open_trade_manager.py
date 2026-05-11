@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +46,7 @@ from .trade_store import (
     resolve_trade_system_name,
     summarize_trade_close_events,
     to_float,
+    to_int,
 )
 
 
@@ -68,6 +70,7 @@ class OpenTradeManager:
         "Exit Partial": 20,
         "Exit Now": 5,
     }
+    EXCLUDED_GHOST_TRADE_NUMBERS = {112, 113, 116}
     MARKET_OPEN_HOUR = 8
     MARKET_OPEN_MINUTE = 30
     MARKET_CLOSE_HOUR = 15
@@ -75,6 +78,7 @@ class OpenTradeManager:
     MORNING_SNAPSHOT_DELAY_MINUTES = 2
     EOD_SUMMARY_DELAY_MINUTES = 10
     BACKGROUND_INTERVAL_SECONDS = 60
+    SHARED_CONTEXT_CACHE_TTL_SECONDS = 180
     APOLLO_HEALTHY_EM_THRESHOLD = 2.0
     APOLLO_WATCH_EM_THRESHOLD = 1.5
     TALOS_HEALTHY_EM_THRESHOLD = 3.0
@@ -118,6 +122,9 @@ class OpenTradeManager:
         self._monitor_lock = RLock()
         self._monitor_timer: RuntimeJobHandle | None = None
         self._monitor_running = False
+        self._shared_context_cache: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+        self._shared_context_cache_lock = RLock()
+        self._normalization_log_cache: Dict[tuple[str, tuple[str, ...]], datetime] = {}
 
     def initialize(self) -> None:
         self.state_repository.initialize()
@@ -194,11 +201,30 @@ class OpenTradeManager:
         now = self._now()
         if not self._is_monitor_window(now):
             return {"ran": False, "reason": "outside-monitor-window", "evaluated_at": now.isoformat()}
-        payload = self.evaluate_open_trades(send_alerts=True)
+        if not self.notifications_enabled():
+            return {"ran": False, "reason": "notifications-disabled", "evaluated_at": now.isoformat()}
+        open_trades = self._load_open_trades()
+        if not any(str(item.get("trade_mode") or "").strip().lower() == "real" for item in open_trades):
+            return {
+                "ran": False,
+                "reason": "no-real-open-trades",
+                "evaluated_at": now.isoformat(),
+                "open_trade_count": len(open_trades),
+            }
+        payload = self.evaluate_open_trades(
+            send_alerts=True,
+            caller_source="job:open-trade-background-monitor",
+        )
         self.state_repository.mark_runtime_setting("last_background_run_at", now.isoformat())
         return {"ran": True, **payload}
 
-    def evaluate_open_trades(self, *, send_alerts: bool = False) -> Dict[str, Any]:
+    def evaluate_open_trades(
+        self,
+        *,
+        send_alerts: bool = False,
+        caller_source: str = "open-trade-evaluation",
+        include_apollo_context: bool = False,
+    ) -> Dict[str, Any]:
         now = self._now()
         open_trades = self._load_open_trades()
         global_notification_settings = self.load_global_notification_settings()
@@ -213,7 +239,12 @@ class OpenTradeManager:
             notifications_by_trade_id = self._load_trade_notifications(open_trades)
             states_by_trade = self._load_management_states()
             runtime_settings = self._load_runtime_settings()
-        shared_context = self._build_shared_context(open_trades, now)
+        shared_context = self._build_shared_context(
+            open_trades,
+            now,
+            caller_source=caller_source,
+            include_apollo_context=include_apollo_context,
+        )
         alerts_sent = 0
         alert_failures: List[str] = []
         records: List[Dict[str, Any]] = []
@@ -302,7 +333,7 @@ class OpenTradeManager:
         if not trade:
             return None
         now = self._now()
-        shared_context = self._build_shared_context([trade], now)
+        shared_context = self._build_shared_context([trade], now, caller_source=f"job:trade-record:{trade_id}")
         return self._evaluate_trade(trade, shared_context, now)
 
     def send_manual_status_update(self, *, trade_mode: str) -> Dict[str, Any]:
@@ -317,7 +348,10 @@ class OpenTradeManager:
                 "notifications_enabled": bool(self.notifications_enabled()),
             }
 
-        payload = self.evaluate_open_trades(send_alerts=False)
+        payload = self.evaluate_open_trades(
+            send_alerts=False,
+            caller_source=f"job:manual-status-update:{normalized_trade_mode}",
+        )
         selected_records = [
             item for item in payload["records"] if str(item.get("trade_mode") or "").strip().lower() == normalized_trade_mode
         ]
@@ -361,25 +395,62 @@ class OpenTradeManager:
             "sent_at": outcome.get("sent_at"),
         }
 
-    def _build_shared_context(self, open_trades: List[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+    def _build_shared_context(
+        self,
+        open_trades: List[Dict[str, Any]],
+        now: datetime,
+        *,
+        caller_source: str,
+        include_apollo_context: bool = False,
+    ) -> Dict[str, Any]:
         normalized_systems = {resolve_trade_system_name(item).strip().lower() for item in open_trades}
         has_apollo_trades = "apollo" in normalized_systems
+        normalized_expiration_map = self._normalize_open_trade_expirations(open_trades, caller_source=caller_source)
+        resolved_expiration_keys = tuple(sorted({item["resolved"] for item in normalized_expiration_map.values()}))
+        cache_key = (
+            resolved_expiration_keys,
+            has_apollo_trades,
+            bool(include_apollo_context and has_apollo_trades),
+        )
+        with self._shared_context_cache_lock:
+            cached_entry = self._shared_context_cache.get(cache_key)
+            if cached_entry is not None:
+                cached_at = cached_entry.get("cached_at")
+                cached_context = cached_entry.get("context")
+                if isinstance(cached_at, datetime) and isinstance(cached_context, dict):
+                    if (now - cached_at) <= timedelta(seconds=self.SHARED_CONTEXT_CACHE_TTL_SECONDS):
+                        LOGGER.info(
+                            "Open-trade shared context cache hit | caller=%s | expiration_targets=%s | include_apollo_context=%s",
+                            caller_source,
+                            list(resolved_expiration_keys),
+                            bool(include_apollo_context and has_apollo_trades),
+                        )
+                        return copy.deepcopy(cached_context)
+
+        LOGGER.warning(
+            "Open-trade shared context refresh | caller=%s | open_trade_count=%s | expiration_targets=%s | include_apollo_context=%s",
+            caller_source,
+            len(open_trades),
+            list(resolved_expiration_keys),
+            bool(include_apollo_context and has_apollo_trades),
+        )
+
         with ThreadPoolExecutor(max_workers=2) as executor:
             spx_future = executor.submit(self._safe_snapshot, "^GSPC", query_type="open_trade_management_spx")
             vix_future = executor.submit(self._safe_snapshot, "^VIX", query_type="open_trade_management_vix")
             spx_snapshot = spx_future.result()
             vix_snapshot = vix_future.result()
-        expirations = {
-            parsed_date
-            for parsed_date in (self._coerce_trade_expiration(item) for item in open_trades)
-            if parsed_date is not None
-        }
         option_chains: Dict[str, Any] = {}
-        sorted_expirations = sorted(expirations)
+        sorted_expirations = [date.fromisoformat(value) for value in resolved_expiration_keys]
         if sorted_expirations:
             with ThreadPoolExecutor(max_workers=min(4, len(sorted_expirations))) as executor:
                 future_map = {
-                    executor.submit(self.options_chain_service.get_spx_option_chain_summary, expiration_date): expiration_date
+                    executor.submit(
+                        self.options_chain_service.get_spx_option_chain_summary,
+                        expiration_date,
+                        caller_context=caller_source,
+                        log_normalization=False,
+                    ): expiration_date
                     for expiration_date in sorted_expirations
                 }
                 for future, expiration_date in future_map.items():
@@ -393,31 +464,73 @@ class OpenTradeManager:
 
         apollo_context: Dict[str, Any] = {}
         context_futures: Dict[Any, str] = {}
-        context_worker_count = int(has_apollo_trades)
+        context_worker_count = int(has_apollo_trades and include_apollo_context)
         if context_worker_count > 0:
             with ThreadPoolExecutor(max_workers=context_worker_count) as executor:
-                if has_apollo_trades:
-                    context_futures[executor.submit(self._build_apollo_management_context)] = "apollo"
+                if has_apollo_trades and include_apollo_context:
+                    context_futures[executor.submit(self._build_apollo_management_context, caller_source=caller_source)] = "apollo"
                 for future, context_name in context_futures.items():
                     if context_name == "apollo":
                         apollo_context = future.result()
-        return {
+        shared_context = {
             "now": now,
             "spx_snapshot": spx_snapshot,
             "vix_snapshot": vix_snapshot,
             "option_chains": option_chains,
             "prepared_option_chains": prepared_option_chains,
+            "normalized_expiration_map": normalized_expiration_map,
             "apollo": apollo_context,
             "current_spx": current_spx,
             "current_vix": self._coerce_float((vix_snapshot or {}).get("Latest Value")),
         }
+        with self._shared_context_cache_lock:
+            self._shared_context_cache[cache_key] = {
+                "cached_at": now,
+                "context": copy.deepcopy(shared_context),
+            }
+        return shared_context
 
-    def _build_apollo_management_context(self) -> Dict[str, Any]:
+    def _normalize_open_trade_expirations(
+        self,
+        open_trades: List[Dict[str, Any]],
+        *,
+        caller_source: str,
+    ) -> Dict[str, Dict[str, str]]:
+        normalized_map: Dict[str, Dict[str, str]] = {}
+        normalization_messages: list[str] = []
+        for expiration_date in (self._coerce_trade_expiration(item) for item in open_trades):
+            if expiration_date is None:
+                continue
+            resolved_expiration, normalization_reason = self.options_chain_service.resolve_requested_expiration_date(expiration_date)
+            requested_key = expiration_date.isoformat()
+            normalized_map[requested_key] = {
+                "requested": requested_key,
+                "resolved": resolved_expiration.isoformat(),
+                "reason": str(normalization_reason or ""),
+            }
+            if normalization_reason:
+                normalization_messages.append(
+                    f"{requested_key}->{resolved_expiration.isoformat()} ({normalization_reason})"
+                )
+
+        normalization_key = (caller_source, tuple(sorted(normalization_messages)))
+        if normalization_messages:
+            prior_logged_at = self._normalization_log_cache.get(normalization_key)
+            if prior_logged_at is None or (self._now() - prior_logged_at) > timedelta(seconds=self.SHARED_CONTEXT_CACHE_TTL_SECONDS):
+                self._normalization_log_cache[normalization_key] = self._now()
+                LOGGER.info(
+                    "Open-trade expiration normalization | caller=%s | normalized=%s",
+                    caller_source,
+                    "; ".join(normalization_messages),
+                )
+        return normalized_map
+
+    def _build_apollo_management_context(self, *, caller_source: str) -> Dict[str, Any]:
         apollo_context: Dict[str, Any] = {}
         try:
             management_context_builder = getattr(self.apollo_service, "build_management_context", None)
             if callable(management_context_builder):
-                apollo_context = management_context_builder()
+                apollo_context = management_context_builder(caller_source=caller_source)
             else:
                 apollo_precheck = self.apollo_service.run_precheck()
                 apollo_context = {
@@ -641,7 +754,7 @@ class OpenTradeManager:
             current_pl = round((net_credit_per_contract - current_close_price) * remaining_contracts * 100.0, 2)
 
         expiration_date = self._coerce_trade_expiration(trade)
-        expiration_key = expiration_date.isoformat() if expiration_date is not None else ""
+        expiration_key = self._resolve_option_chain_lookup_key(expiration_date, shared_context)
         chain_summary = (shared_context.get("option_chains") or {}).get(expiration_key) if expiration_key else None
         prepared_chain = (shared_context.get("prepared_option_chains") or {}).get(expiration_key) if expiration_key else None
         current_live_expected_move_details = self._estimate_live_expected_move_from_chain(
@@ -713,7 +826,10 @@ class OpenTradeManager:
         distance_to_long = float(metrics.get("distance_to_long") or 0.0)
         short_breach = self._is_strike_breached(distance_to_short)
         long_breach = self._is_long_stop_breached(distance_to_short=distance_to_short, distance_to_long=distance_to_long)
-        current_structure = self._coerce_text(apollo_context.get("current_structure_grade"), fallback="Not used for status")
+        current_structure = self._coerce_text(
+            apollo_context.get("current_structure_grade") or metrics.get("entry_structure_grade"),
+            fallback="Not used for status",
+        )
         current_live_expected_move = self._coerce_float(metrics.get("current_live_expected_move"))
         em_multiple = self._safe_divide(distance_to_short, current_live_expected_move)
 
@@ -889,6 +1005,7 @@ class OpenTradeManager:
                 for trade in self.trade_store.list_trades(trade_mode)
                 if str(trade.get("derived_status_raw") or trade.get("status") or "").strip().lower() in {"open", "reduced"}
                 and is_retained_trade_system(trade)
+                and to_int(trade.get("trade_number")) not in self.EXCLUDED_GHOST_TRADE_NUMBERS
             )
         return rows
 
@@ -1090,11 +1207,12 @@ class OpenTradeManager:
         expiration = self._coerce_trade_expiration(trade)
         if expiration is None:
             return None
-        chain_summary = (shared_context.get("option_chains") or {}).get(expiration.isoformat()) or {}
+        option_chain_lookup_key = self._resolve_option_chain_lookup_key(expiration, shared_context)
+        chain_summary = (shared_context.get("option_chains") or {}).get(option_chain_lookup_key) or {}
         if not chain_summary.get("success"):
             return None
         option_type = self._coerce_text(trade.get("option_type"), fallback="Put Credit Spread")
-        prepared_chain = (shared_context.get("prepared_option_chains") or {}).get(expiration.isoformat()) or {}
+        prepared_chain = (shared_context.get("prepared_option_chains") or {}).get(option_chain_lookup_key) or {}
         strike_lookup = prepared_chain.get("calls_by_strike") if "call" in option_type.lower() else prepared_chain.get("puts_by_strike")
         if not isinstance(strike_lookup, dict):
             contracts = chain_summary.get("calls") if "call" in option_type.lower() else chain_summary.get("puts")
@@ -1110,6 +1228,13 @@ class OpenTradeManager:
         if short_mark is None or long_mark is None:
             return None
         return round(max(short_mark - long_mark, 0.0), 2)
+
+    def _resolve_option_chain_lookup_key(self, expiration: date | None, shared_context: Dict[str, Any]) -> str:
+        if expiration is None:
+            return ""
+        requested_key = expiration.isoformat()
+        normalized_entry = (shared_context.get("normalized_expiration_map") or {}).get(requested_key) or {}
+        return str(normalized_entry.get("resolved") or requested_key)
 
     def _option_executable_price(self, contract: Dict[str, Any], *, side: str) -> float | None:
         if side == "buy":

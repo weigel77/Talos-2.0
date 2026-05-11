@@ -46,24 +46,41 @@ class OptionsChainService:
         self._summary_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._normalization_log_cache: Dict[tuple[str, str, str, str], datetime] = {}
 
-    def get_spx_option_chain_summary(self, expiration_date: date) -> Dict[str, Any]:
+    def resolve_requested_expiration_date(self, expiration_date: date) -> tuple[date, str | None]:
+        return self._normalize_requested_expiration_date(expiration_date)
+
+    def get_spx_option_chain_summary(
+        self,
+        expiration_date: date,
+        *,
+        caller_context: str | None = None,
+        log_normalization: bool = True,
+    ) -> Dict[str, Any]:
         """Return a compact normalized next-market-day SPX option-chain summary."""
         provider = None
         requested_expiration = expiration_date
         resolved_expiration, normalization_reason = self._normalize_requested_expiration_date(expiration_date)
-        caller_context = self._describe_option_chain_request_caller()
+        resolved_caller_context = str(caller_context or self._describe_option_chain_request_caller()).strip() or "unknown"
         cache_key = ("spx", resolved_expiration.isoformat())
         cached_summary = self._get_cached_summary(cache_key)
         if cached_summary is not None:
             return cached_summary
         try:
-            if normalization_reason:
+            if normalization_reason and log_normalization:
                 self._log_normalization_once(
-                    caller_context=caller_context,
+                    caller_context=resolved_caller_context,
                     requested_expiration=requested_expiration,
                     resolved_expiration=resolved_expiration,
                     normalization_reason=normalization_reason,
                 )
+
+            LOGGER.warning(
+                "Apollo option-chain refresh | caller=%s | requested_expiration=%s | resolved_expiration=%s | cache_hit=%s",
+                resolved_caller_context,
+                requested_expiration.isoformat(),
+                resolved_expiration.isoformat(),
+                False,
+            )
 
             provider = self._resolve_provider()
             chain = provider.get_option_chain("^GSPC", target_date=resolved_expiration)

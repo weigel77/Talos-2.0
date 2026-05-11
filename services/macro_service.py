@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import date, datetime
 import logging
 import re
+from threading import Lock
 from typing import Any, Dict, Iterable, List
 from zoneinfo import ZoneInfo
 
@@ -42,6 +44,7 @@ class MacroService:
     }
     REQUEST_TIMEOUT = 20
     SOURCE_TIMEZONE = ZoneInfo("America/New_York")
+    STATUS_CACHE_TTL_SECONDS = 120
 
     MAJOR_PATTERNS = [
         ("FOMC", re.compile(r"federal funds rate|interest rate decision|rate decision|fomc announcement|fomc decision|fed funds target", re.IGNORECASE)),
@@ -62,6 +65,8 @@ class MacroService:
     def __init__(self, config: AppConfig | None = None) -> None:
         self.config = config or get_app_config()
         self.display_timezone = ZoneInfo(self.config.app_timezone)
+        self._status_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._status_cache_lock = Lock()
 
     def get_macro_status(self, target_date: date | None = None) -> Dict[str, Any]:
         """Return the current macro-event status from live calendar sources."""
@@ -69,6 +74,13 @@ class MacroService:
         provider = (self.config.macro_provider or "marketwatch").lower()
         target_date = target_date or checked_at.date()
         checked_dates = sorted({checked_at.date(), target_date})
+        cache_key = (provider, ",".join(item.isoformat() for item in checked_dates))
+
+        with self._status_cache_lock:
+            cached = self._status_cache.get(cache_key)
+            if cached and checked_at.timestamp() <= float(cached.get("expires_at") or 0.0):
+                return copy.deepcopy(cached.get("payload") or {})
+
         attempts: List[Dict[str, Any]] = []
 
         source_loaders = self._resolve_source_loaders(provider)
@@ -83,7 +95,7 @@ class MacroService:
                     detail=f"Loaded {len(events)} matching US event row(s).",
                 )
                 attempts.append(diagnostic)
-                return self._build_status_from_events(
+                payload = self._build_status_from_events(
                     source_key=source_key,
                     source_label=label,
                     checked_at=checked_at,
@@ -93,6 +105,8 @@ class MacroService:
                     attempts=attempts,
                     selected_attempt=diagnostic,
                 )
+                self._store_cached_status(cache_key, payload, checked_at=checked_at)
+                return payload
             except MacroSourceError as exc:  # pragma: no cover - network failures are environment-dependent
                 diagnostic = self._merge_attempt_diagnostic(
                     label,
@@ -120,7 +134,7 @@ class MacroService:
                     )
                 )
 
-        return {
+        unavailable_payload = {
             "has_major_macro": False,
             "macro_events": [],
             "source_name": "MarketWatch unavailable → no fallback source succeeded",
@@ -134,6 +148,15 @@ class MacroService:
             "source_attempts": attempts,
             "diagnostic": attempts[0] if attempts else {},
         }
+        self._store_cached_status(cache_key, unavailable_payload, checked_at=checked_at)
+        return unavailable_payload
+
+    def _store_cached_status(self, cache_key: tuple[str, str], payload: Dict[str, Any], *, checked_at: datetime) -> None:
+        with self._status_cache_lock:
+            self._status_cache[cache_key] = {
+                "expires_at": checked_at.timestamp() + self.STATUS_CACHE_TTL_SECONDS,
+                "payload": copy.deepcopy(payload),
+            }
 
     def _resolve_source_loaders(self, provider: str) -> List[tuple[str, str, Any]]:
         if provider in {"marketwatch", "live", "default"}:

@@ -47,7 +47,7 @@ class ApolloStructureService:
         self.display_timezone = ZoneInfo(self.config.app_timezone)
         self.market_calendar_service = MarketCalendarService(self.config)
 
-    def analyze_same_day_spx_structure(self) -> Dict[str, Any]:
+    def analyze_same_day_spx_structure(self, *, caller_source: str = "apollo-structure") -> Dict[str, Any]:
         """Return current or fallback-session SPX structure metrics, chart data, and classification output."""
         provider_name = self.market_data_service.get_provider_metadata().get("live_provider_name", "Unknown Provider")
         preferred_source = (self.config.apollo_structure_source or "spx").strip().lower()
@@ -63,10 +63,17 @@ class ApolloStructureService:
         else:
             normalized_session_date = requested_session_date
             normalization_reason = ""
+        LOGGER.warning(
+            "Apollo structure refresh | caller=%s | requested_session_date=%s | resolved_session_date=%s",
+            caller_source,
+            requested_session_date.isoformat(),
+            normalized_session_date.isoformat(),
+        )
         requested_status = self.market_calendar_service._get_market_day_status(requested_session_date)
         if normalized_session_date != requested_session_date:
             LOGGER.info(
-                "Apollo structure session normalized | requested_session_date=%s | resolved_session_date=%s | reason=%s",
+                "Apollo structure session normalized | caller=%s | requested_session_date=%s | resolved_session_date=%s | reason=%s",
+                caller_source,
                 requested_session_date.isoformat(),
                 normalized_session_date.isoformat(),
                 normalization_reason or "latest valid tradable session",
@@ -81,6 +88,7 @@ class ApolloStructureService:
                 symbol=source_config["symbol"],
                 requested_session_date=normalized_session_date,
                 attempted_sources=attempted_sources,
+                caller_source=caller_source,
             )
             if session_result is None:
                 continue
@@ -149,11 +157,13 @@ class ApolloStructureService:
         symbol: str,
         requested_session_date: date,
         attempted_sources: List[Dict[str, str]],
+        caller_source: str,
     ) -> Dict[str, Any] | None:
         last_error: str | None = None
         for session_date in self._session_candidates(requested_session_date):
             LOGGER.info(
-                "Apollo structure attempt | source_key=%s | symbol=%s | session_date=%s | query_type=%s",
+                "Apollo structure attempt | caller=%s | source_key=%s | symbol=%s | session_date=%s | query_type=%s",
+                caller_source,
                 source_key,
                 symbol,
                 session_date.isoformat(),

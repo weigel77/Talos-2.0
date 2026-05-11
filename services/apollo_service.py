@@ -42,7 +42,7 @@ class ApolloService:
         self._management_context_cache_expires_at: datetime | None = None
         self._management_context_cache_lock = Lock()
 
-    def run_precheck(self, *, force_refresh: bool = False) -> Dict[str, Any]:
+    def run_precheck(self, *, force_refresh: bool = False, caller_source: str = "apollo-precheck") -> Dict[str, Any]:
         """Execute the first-stage Apollo workflow."""
         checked_at = datetime.now(self.display_timezone)
         reasons: List[str] = []
@@ -92,8 +92,15 @@ class ApolloService:
         )
         with ThreadPoolExecutor(max_workers=3) as executor:
             macro_future = executor.submit(self.macro_service.get_macro_status, calendar_context["next_market_day"])
-            structure_future = executor.submit(self.structure_service.analyze_same_day_spx_structure)
-            option_chain_future = executor.submit(self.options_chain_service.get_spx_option_chain_summary, calendar_context["next_market_day"])
+            structure_future = executor.submit(
+                self.structure_service.analyze_same_day_spx_structure,
+                caller_source=caller_source,
+            )
+            option_chain_future = executor.submit(
+                self.options_chain_service.get_spx_option_chain_summary,
+                calendar_context["next_market_day"],
+                caller_context=caller_source,
+            )
             macro_status = macro_future.result()
             structure = structure_future.result()
             option_chain = option_chain_future.result()
@@ -173,7 +180,7 @@ class ApolloService:
             "reasons": reasons,
         }
 
-    def build_management_context(self) -> Dict[str, Any]:
+    def build_management_context(self, *, caller_source: str = "apollo-management-context") -> Dict[str, Any]:
         if self.config.runtime_target == "local":
             now = datetime.now(self.display_timezone)
             with self._management_context_cache_lock:
