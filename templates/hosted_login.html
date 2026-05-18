@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page_browser_title }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page-shell hosted-launch-shell">
+        <section class="hero-card delphi-header-card hosted-launch-card">
+            <div class="delphi-header-backdrop"></div>
+            <div class="delphi-header-content">
+                <div class="delphi-header-top">
+                    <div class="delphi-header-brand">
+                        <div>
+                            <p class="hero-kicker">TALOS 3.10</p>
+                            <h1>{{ page_heading }}</h1>
+                            <p class="hero-copy delphi-header-copy">{{ page_copy }}</p>
+                        </div>
+                    </div>
+                    <div class="delphi-header-meta delphi-header-meta-hosted">
+                        <span class="hero-version">Desktop Hosted Sign In</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="hosted-shell-panel hosted-launch-panel">
+            <div class="hosted-shell-panel-header">
+                <div>
+                    <h2>Hosted Access</h2>
+                    <p class="hosted-shell-subtle">Sign in once to reach the Talos hosted workspace directly. The mobile launcher is bypassed for this hotfix.</p>
+                </div>
+            </div>
+            <form method="post" action="{{ login_action_url }}" class="trade-form-grid">
+                {% if next_path %}
+                <input type="hidden" name="next" value="{{ next_path }}">
+                {% endif %}
+                <div class="trade-form-field full-width">
+                    <label for="hosted-email">Email</label>
+                    <input id="hosted-email" name="email" type="email" value="{{ form_email }}" autocomplete="username" required>
+                </div>
+                <div class="trade-form-field full-width">
+                    <label for="hosted-password">Password</label>
+                    <input id="hosted-password" name="password" type="password" autocomplete="current-password" required>
+                </div>
+                {% if error_message %}
+                <div class="message message-error full-width">{{ error_message }}</div>
+                {% endif %}
+                <div class="trade-form-actions full-width">
+                    <button type="submit" class="button-link">Open Hosted Talos</button>
+                    <a class="button-link button-link-secondary" href="{{ url_for('hosted_shell_home') }}">Back to Hosted Home</a>
+                </div>
+            </form>
+        </section>
+    </main>
+</body>
+</html>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta
+from time import perf_counter
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,7 @@ from .cache_service import CacheEntry, CacheService
 from .calculations import add_daily_change_columns, calculate_percent_change, calculate_point_change
 from .market_calendar_service import MarketCalendarService
 from .provider_factory import ProviderFactory
+from .runtime_metrics_service import get_runtime_metrics_service
 from .runtime.provider_composition import LocalProviderComposer, ProviderComposer
 from .providers.base_provider import (
     ProviderAuthRequiredError,
@@ -66,6 +68,7 @@ class MarketDataService:
         self.cache_service = cache_service or CacheService()
         self.market_calendar_service = MarketCalendarService(self.config)
         self.live_provider = provider or ProviderFactory.create_live_provider(self.config, provider_composer=self.provider_composer)
+        self.latest_cache_seconds = max(int(self.config.market_snapshot_cache_ttl_seconds or LATEST_CACHE_SECONDS), 1)
         if historical_providers is not None:
             self.historical_providers = historical_providers
         elif provider is not None:
@@ -93,11 +96,19 @@ class MarketDataService:
         fresh: bool,
     ) -> Dict[str, Any]:
         """Reuse the same latest snapshot across a single request when the ticker matches."""
+        started = perf_counter()
+        metrics = get_runtime_metrics_service()
         provider = self.live_provider
         provider_key = provider.get_metadata().get("provider_key", "unknown")
         request_cache = self._get_request_market_data_cache()
         request_cache_key = f"{provider_key}:{ticker}:latest"
         if not fresh and request_cache is not None and request_cache_key in request_cache:
+            metrics.record(
+                "Schwab snapshot calls",
+                (perf_counter() - started) * 1000.0,
+                cache_hit=True,
+                detail=f"{ticker}|request-cache|{query_type}",
+            )
             return self.cache_service.clone_payload(request_cache[request_cache_key])
 
         effective_query_type = query_type if not fresh else f"{query_type}:fresh:{self._current_time().isoformat()}"
@@ -106,14 +117,22 @@ class MarketDataService:
             ticker=ticker,
             query_type=effective_query_type,
         )
+        cached_entry = self.cache_service.get_cached_result(cache_key)
+        cache_hit = bool(cached_entry and self.cache_service.is_cache_valid(cached_entry, self.latest_cache_seconds, self._current_time()))
         payload = self._execute_cached_query(
             cache_key=cache_key,
-            ttl_seconds=LATEST_CACHE_SECONDS,
+            ttl_seconds=self.latest_cache_seconds,
             fetcher=lambda: self._build_latest_snapshot(ticker),
             provider=provider,
         )
         if not fresh and request_cache is not None:
             request_cache[request_cache_key] = self.cache_service.clone_payload(payload)
+        metrics.record(
+            "Schwab snapshot calls",
+            (perf_counter() - started) * 1000.0,
+            cache_hit=cache_hit,
+            detail=f"{ticker}|{'fresh' if fresh else 'shared-cache'}|{query_type}",
+        )
         return payload
 
     def get_history_with_changes(self, ticker: str, start_date: date, end_date: date, query_type: str = "history") -> pd.DataFrame:
@@ -233,6 +252,23 @@ class MarketDataService:
             interval_minutes=interval_minutes,
             query_type=query_type,
             fresh=True,
+        )
+
+    def get_account_summary(self, *, force_refresh: bool = False) -> Dict[str, Any]:
+        """Return the authenticated broker account summary from the active live provider."""
+        provider = self.live_provider
+        provider_key = provider.get_metadata().get("provider_key", "unknown")
+        query_type = "account_summary" if not force_refresh else f"account_summary:fresh:{self._current_time().isoformat()}"
+        cache_key = self.cache_service.build_cache_key(
+            provider=provider_key,
+            ticker="ACCOUNT",
+            query_type=query_type,
+        )
+        return self._execute_cached_query(
+            cache_key=cache_key,
+            ttl_seconds=LATEST_CACHE_SECONDS,
+            fetcher=lambda: provider.get_account_summary(),
+            provider=provider,
         )
 
     def resolve_intraday_session_request(

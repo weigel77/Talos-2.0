@@ -24,9 +24,9 @@ try {
     }
     $env:HOSTED_PUBLIC_BASE_URL = 'https://eigeltrade.com'
     $env:SCHWAB_REDIRECT_URI = 'https://eigeltrade.com/callback'
-    $env:APP_DISPLAY_NAME = 'Delphi 8.0.7'
-    $env:APP_PAGE_KICKER = 'Delphi 8.0.7'
-    $env:APP_VERSION_LABEL = 'Version 8.0.7'
+    $env:APP_DISPLAY_NAME = 'Talos 3.6'
+    $env:APP_PAGE_KICKER = 'TALOS 3.6'
+    $env:APP_VERSION_LABEL = 'TALOS 3.6'
     $env:SESSION_COOKIE_NAME = 'delphi5_hosted_session'
     $env:OAUTH_SESSION_NAMESPACE = 'delphi5hosted'
     & $pythonExe app.py

@@ -1,14 +1,17 @@
-"""Open-trade management, scheduled notifications, and deduped alerts."""
+"""Open-trade management and Talos Fortress exit-gate evaluation."""
 
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from threading import RLock
+from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -18,6 +21,7 @@ from .apollo_service import ApolloService
 from .market_calendar_service import MarketCalendarService
 from .market_data import MarketDataError, MarketDataService
 from .options_chain_service import OptionsChainService
+from .providers.base_provider import ProviderAuthRequiredError, ProviderError, ProviderReauthenticationRequiredError
 from .repositories.management_state_repository import (
     OpenTradeManagementStateRepository,
     SQLiteOpenTradeManagementStateRepository,
@@ -27,6 +31,7 @@ from .repositories.global_notification_settings_repository import GlobalNotifica
 from .repositories.trade_notification_repository import TradeNotificationRepository
 from .repositories.trade_repository import TradeRepository
 from .runtime.notifications import NotificationDelivery
+from .runtime_metrics_service import get_runtime_metrics_service
 from .runtime.scheduler import RuntimeJobHandle, RuntimeScheduler, ThreadingTimerScheduler
 from .trade_notifications import (
     GLOBAL_NOTIFICATION_DAILY_END,
@@ -54,7 +59,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class OpenTradeManager:
-    """Classify open trades and send low-noise management alerts."""
+    """Classify open trades and evaluate Talos Fortress exit gates."""
 
     STATUS_SEVERITY = {
         "Closed": 0,
@@ -83,6 +88,16 @@ class OpenTradeManager:
     APOLLO_WATCH_EM_THRESHOLD = 1.5
     TALOS_HEALTHY_EM_THRESHOLD = 3.0
     TALOS_WATCH_EM_THRESHOLD = 1.5
+    TALOS_GATE_1_BUFFER_POINTS = 15.0
+    TALOS_GATE_2_BUFFER_POINTS = 5.0
+    TALOS_GATE_4_DURATION_MINUTES = 30
+    TALOS_GATE_SEQUENCE = ("gate_1", "gate_2", "gate_3", "gate_4")
+    TALOS_GATE_LABELS = {
+        "gate_1": "Gate 1",
+        "gate_2": "Gate 2",
+        "gate_3": "Gate 3",
+        "gate_4": "Gate 4",
+    }
 
     def __init__(
         self,
@@ -125,6 +140,7 @@ class OpenTradeManager:
         self._shared_context_cache: Dict[tuple[Any, ...], Dict[str, Any]] = {}
         self._shared_context_cache_lock = RLock()
         self._normalization_log_cache: Dict[tuple[str, tuple[str, ...]], datetime] = {}
+        self._talos_gate_test_hook = "live"
 
     def initialize(self) -> None:
         self.state_repository.initialize()
@@ -134,11 +150,7 @@ class OpenTradeManager:
             self.global_notification_settings_repository.initialize()
 
     def start_background_monitoring(self) -> None:
-        with self._monitor_lock:
-            if self._monitor_running:
-                return
-            self._monitor_running = True
-            self._schedule_background_monitor()
+        return
 
     def shutdown(self) -> None:
         with self._monitor_lock:
@@ -148,30 +160,14 @@ class OpenTradeManager:
                 self._monitor_timer = None
 
     def set_notifications_enabled(self, enabled: bool) -> None:
-        self.state_repository.set_notifications_enabled(enabled)
-        settings = self.load_global_notification_settings()
-        target_keys = {GLOBAL_NOTIFICATION_OPEN_TRADES}
-        if self.global_notification_settings_repository is None:
-            target_keys = {
-                GLOBAL_NOTIFICATION_OPEN_TRADES,
-                GLOBAL_NOTIFICATION_DAILY_START,
-                GLOBAL_NOTIFICATION_DAILY_END,
-            }
-        updated = [
-            {**item, "enabled": bool(enabled)} if item.get("key") in target_keys else dict(item)
-            for item in settings
-        ]
-        self.save_global_notification_settings(updated)
+        del enabled
+        return
 
     def notifications_enabled(self) -> bool:
-        settings = {item["key"]: item for item in self.load_global_notification_settings() if item.get("key")}
-        return bool((settings.get(GLOBAL_NOTIFICATION_OPEN_TRADES) or {}).get("enabled", True))
+        return False
 
     def load_global_notification_settings(self) -> List[Dict[str, Any]]:
-        if self.global_notification_settings_repository is None:
-            fallback_enabled = bool(self.state_repository.load_runtime_settings().get("notifications_enabled", True))
-            return [{**item, "enabled": fallback_enabled} for item in default_global_notification_settings()]
-        return self.global_notification_settings_repository.load_settings()
+        return []
 
     def save_global_notification_settings(self, settings: List[Dict[str, Any]]) -> None:
         if self.global_notification_settings_repository is None:
@@ -179,44 +175,21 @@ class OpenTradeManager:
         self.global_notification_settings_repository.save_settings(settings)
 
     def _schedule_background_monitor(self) -> None:
-        if not self._monitor_running:
-            return
-        self._monitor_timer = self.scheduler.schedule(
-            self.BACKGROUND_INTERVAL_SECONDS,
-            self._background_monitor_tick,
-            daemon=True,
-        )
+        return
 
     def _background_monitor_tick(self) -> None:
-        try:
-            self.run_background_monitor_cycle()
-        except Exception as exc:  # pragma: no cover - defensive scheduler guard
-            LOGGER.warning("Open trade background monitor failed: %s", exc)
-        finally:
-            with self._monitor_lock:
-                if self._monitor_running:
-                    self._schedule_background_monitor()
+        return
 
     def run_background_monitor_cycle(self) -> Dict[str, Any]:
         now = self._now()
-        if not self._is_monitor_window(now):
-            return {"ran": False, "reason": "outside-monitor-window", "evaluated_at": now.isoformat()}
-        if not self.notifications_enabled():
-            return {"ran": False, "reason": "notifications-disabled", "evaluated_at": now.isoformat()}
-        open_trades = self._load_open_trades()
-        if not any(str(item.get("trade_mode") or "").strip().lower() == "real" for item in open_trades):
-            return {
-                "ran": False,
-                "reason": "no-real-open-trades",
-                "evaluated_at": now.isoformat(),
-                "open_trade_count": len(open_trades),
-            }
-        payload = self.evaluate_open_trades(
-            send_alerts=True,
-            caller_source="job:open-trade-background-monitor",
-        )
-        self.state_repository.mark_runtime_setting("last_background_run_at", now.isoformat())
-        return {"ran": True, **payload}
+        return {"ran": False, "reason": "talos-notifications-removed", "evaluated_at": now.isoformat()}
+
+    def set_talos_gate_test_hook(self, scenario: str | None) -> None:
+        normalized = str(scenario or "live").strip().lower() or "live"
+        self._talos_gate_test_hook = normalized
+
+    def get_talos_gate_test_hook(self) -> str:
+        return str(self._talos_gate_test_hook or "live").strip().lower() or "live"
 
     def evaluate_open_trades(
         self,
@@ -225,105 +198,43 @@ class OpenTradeManager:
         caller_source: str = "open-trade-evaluation",
         include_apollo_context: bool = False,
     ) -> Dict[str, Any]:
+        send_alerts = False
         now = self._now()
         open_trades = self._load_open_trades()
-        global_notification_settings = self.load_global_notification_settings()
-        global_notification_map = {
-            item["key"]: item for item in global_notification_settings if item.get("key")
-        }
-        alert_eligible_trades = [trade for trade in open_trades if str(trade.get("trade_mode") or "").strip().lower() == "real"] if send_alerts else []
-        notifications_by_trade_id: Dict[int, List[Dict[str, Any]]] = {}
-        states_by_trade: Dict[int, Dict[str, Any]] = {}
-        runtime_settings: Dict[str, Any] = {}
-        if send_alerts:
-            notifications_by_trade_id = self._load_trade_notifications(open_trades)
-            states_by_trade = self._load_management_states()
-            runtime_settings = self._load_runtime_settings()
-        shared_context = self._build_shared_context(
-            open_trades,
-            now,
-            caller_source=caller_source,
-            include_apollo_context=include_apollo_context,
-        )
-        alerts_sent = 0
-        alert_failures: List[str] = []
+        global_notification_settings: List[Dict[str, Any]] = []
+        try:
+            shared_context = self._build_shared_context(
+                open_trades,
+                now,
+                caller_source=caller_source,
+                include_apollo_context=include_apollo_context,
+            )
+        except Exception as exc:
+            LOGGER.warning("Open-trade management degraded | caller=%s | error=%s", caller_source, exc)
+            return self._build_market_data_unavailable_payload(now=now, error=str(exc))
         records: List[Dict[str, Any]] = []
-
-        daily_outcomes: list[Dict[str, Any]] = []
         for trade in open_trades:
-            previous_state = states_by_trade.get(int(trade.get("id") or 0), {})
             record = self._evaluate_trade(trade, shared_context, now)
-            if send_alerts:
-                notifications = list(notifications_by_trade_id.get(int(trade.get("id") or 0), normalize_trade_notifications([])))
-                triggered_notifications = evaluate_trade_notifications({**trade, "notifications": notifications}, record)
-                triggered_by_type = {item["type"]: item for item in triggered_notifications}
-                record["notifications"] = [
-                    {
-                        **notification,
-                        "triggered": notification["type"] in triggered_by_type,
-                        "trigger_reason": (triggered_by_type.get(notification["type"]) or {}).get("reason", ""),
-                    }
-                    for notification in notifications
-                ]
-                record["active_notifications"] = [item for item in record["notifications"] if item.get("enabled")]
-                record["triggered_notifications"] = triggered_notifications
-                record["triggered_notification_count"] = len(triggered_notifications)
-                alert_outcome = {"sent": False, "error": "", "priority": None, "alert_type": None, "sent_at": None}
-                record["trade_notification_state"] = {
-                    "last_status": self._coerce_text(trade.get("last_status"), fallback="—"),
-                    "last_action_sent": self._coerce_text(trade.get("last_action_sent"), fallback="—"),
-                    "last_alert_timestamp": self._format_datetime(parse_datetime_value(trade.get("last_alert_timestamp"))),
-                }
-                self._upsert_management_state(record, previous_state, alert_outcome, now)
-                persisted_state = build_management_state_payload(record, previous_state, alert_outcome, now)
-                record["alert_state"] = self._build_alert_state_payload(persisted_state, trade)
             records.append(record)
-
-        if send_alerts:
-            real_records = [
-                item for item in records if str(item.get("trade_mode") or "").strip().lower() == "real"
-            ]
-            daily_outcomes = self._process_daily_notifications(real_records, now, runtime_settings, global_notification_map)
-            for outcome in daily_outcomes:
-                if outcome.get("sent"):
-                    alerts_sent += 1
-                elif outcome.get("error"):
-                    alert_failures.append(str(outcome["error"]))
-            if bool((global_notification_map.get(GLOBAL_NOTIFICATION_OPEN_TRADES) or {}).get("enabled", True)):
-                for trade in alert_eligible_trades:
-                    record = next((item for item in records if int(item.get("trade_id") or 0) == int(trade.get("id") or 0)), None)
-                    if record is None:
-                        continue
-                    previous_state = states_by_trade.get(int(trade.get("id") or 0), {})
-                    alert_outcome = self._process_trade_notifications(trade, record, previous_state, now)
-                    if alert_outcome.get("sent"):
-                        alerts_sent += int(alert_outcome.get("sent_count") or 1)
-                    elif alert_outcome.get("error"):
-                        alert_failures.append(f"Trade #{record['trade_number']}: {alert_outcome['error']}")
-                    self._upsert_management_state(record, previous_state, alert_outcome, now)
-                    persisted_state = build_management_state_payload(record, previous_state, alert_outcome, now)
-                    updated_trade = dict(trade)
-                    updated_trade["last_status"] = str(record.get("status") or "")
-                    updated_trade["last_action_sent"] = str(record.get("action_type") or "")
-                    updated_trade["last_alert_timestamp"] = alert_outcome.get("sent_at") or trade.get("last_alert_timestamp")
-                    record["alert_state"] = self._build_alert_state_payload(persisted_state, updated_trade)
         records.sort(key=lambda item: (-int(item.get("status_severity") or 0), str(item.get("system_name") or ""), -int(item.get("trade_number") or 0)))
         status_counts = self._build_status_counts(records)
         return {
             "evaluated_at": now.isoformat(),
             "evaluated_at_display": self._format_datetime(now),
             "open_trade_count": len(records),
-            "alerts_sent": alerts_sent,
-            "alert_failures": alert_failures,
-            "notifications_enabled": bool((global_notification_map.get(GLOBAL_NOTIFICATION_OPEN_TRADES) or {}).get("enabled", True)),
+            "alerts_sent": 0,
+            "alert_failures": [],
+            "notifications_enabled": False,
             "global_notification_settings": global_notification_settings,
-            "last_morning_snapshot_date": runtime_settings.get("last_morning_snapshot_date") or "",
-            "last_eod_summary_date": runtime_settings.get("last_eod_summary_date") or "",
+            "last_morning_snapshot_date": "",
+            "last_eod_summary_date": "",
             "live_expected_move_display": next((record.get("current_live_expected_move_display") for record in records if record.get("current_live_expected_move_display")), "—"),
             "header_market_snapshots": {
                 "^GSPC": shared_context.get("spx_snapshot") or {},
                 "^VIX": shared_context.get("vix_snapshot") or {},
             },
+            "market_data_available": bool(shared_context.get("market_data_available", True)),
+            "market_data_error": str(shared_context.get("market_data_error") or ""),
             "status_counts": status_counts,
             "records": records,
         }
@@ -340,59 +251,14 @@ class OpenTradeManager:
         normalized_trade_mode = str(trade_mode or "").strip().lower()
         if normalized_trade_mode not in {"real", "simulated"}:
             raise ValueError(f"Unsupported trade mode for manual status update: {trade_mode}")
-        if normalized_trade_mode != "real":
-            return {
-                "sent": False,
-                "error": "",
-                "record_count": 0,
-                "notifications_enabled": bool(self.notifications_enabled()),
-            }
-
-        payload = self.evaluate_open_trades(
-            send_alerts=False,
-            caller_source=f"job:manual-status-update:{normalized_trade_mode}",
-        )
-        selected_records = [
-            item for item in payload["records"] if str(item.get("trade_mode") or "").strip().lower() == normalized_trade_mode
-        ]
-        now = self._now()
-
-        if not selected_records:
-            return {
-                "sent": False,
-                "error": "",
-                "trade_mode": normalized_trade_mode,
-                "record_count": 0,
-                "priority": 0,
-                "alert_type": f"manual-{normalized_trade_mode}-status-update",
-                "sent_at": None,
-            }
-
-        snapshot_payload = self._build_open_positions_snapshot_payload(
-            selected_records,
-            alert_type=f"manual-{normalized_trade_mode}-status-update",
-            reason_code=f"manual-{normalized_trade_mode}-status-update",
-        )
-        outcome = self._send_management_alert(
-            None,
-            {"trade_id": 0, "trade_mode": normalized_trade_mode, "system_name": "Delphi"},
-            snapshot_payload,
-            now,
-        )
-        if outcome.get("sent"):
-            self._stamp_trade_alert_timestamps(
-                [int(item.get("trade_id") or 0) for item in selected_records],
-                outcome.get("sent_at"),
-            )
-
         return {
-            "sent": bool(outcome.get("sent")),
-            "error": str(outcome.get("error") or ""),
+            "sent": False,
+            "error": "Talos notifications are removed.",
             "trade_mode": normalized_trade_mode,
-            "record_count": len(selected_records),
-            "priority": int(outcome.get("priority") or 0),
-            "alert_type": str(outcome.get("alert_type") or f"manual-{normalized_trade_mode}-status-update"),
-            "sent_at": outcome.get("sent_at"),
+            "record_count": 0,
+            "priority": 0,
+            "alert_type": f"manual-{normalized_trade_mode}-status-update-removed",
+            "sent_at": None,
         }
 
     def _build_shared_context(
@@ -403,6 +269,8 @@ class OpenTradeManager:
         caller_source: str,
         include_apollo_context: bool = False,
     ) -> Dict[str, Any]:
+        started = perf_counter()
+        metrics = get_runtime_metrics_service()
         normalized_systems = {resolve_trade_system_name(item).strip().lower() for item in open_trades}
         has_apollo_trades = "apollo" in normalized_systems
         normalized_expiration_map = self._normalize_open_trade_expirations(open_trades, caller_source=caller_source)
@@ -425,6 +293,12 @@ class OpenTradeManager:
                             list(resolved_expiration_keys),
                             bool(include_apollo_context and has_apollo_trades),
                         )
+                        metrics.record(
+                            "OpenTradeManager shared context",
+                            (perf_counter() - started) * 1000.0,
+                            cache_hit=True,
+                            detail=f"{caller_source}|{','.join(resolved_expiration_keys)}",
+                        )
                         return copy.deepcopy(cached_context)
 
         LOGGER.warning(
@@ -445,21 +319,32 @@ class OpenTradeManager:
         if sorted_expirations:
             with ThreadPoolExecutor(max_workers=min(4, len(sorted_expirations))) as executor:
                 future_map = {
-                    executor.submit(
-                        self.options_chain_service.get_spx_option_chain_summary,
-                        expiration_date,
-                        caller_context=caller_source,
-                        log_normalization=False,
-                    ): expiration_date
+                    executor.submit(self._safe_option_chain_summary, expiration_date, caller_source=caller_source): expiration_date
                     for expiration_date in sorted_expirations
                 }
                 for future, expiration_date in future_map.items():
                     option_chains[expiration_date.isoformat()] = future.result()
         current_spx = self._coerce_float((spx_snapshot or {}).get("Latest Value"))
+        spx_intraday_candles = self._safe_intraday_candles("^GSPC", caller_source=caller_source)
         prepared_option_chains = self._prepare_option_chain_contexts(
             option_chains=option_chains,
             spot=current_spx,
             evaluation_date=now.date(),
+        )
+        market_data_errors = [
+            str((spx_snapshot or {}).get("message") or "").strip(),
+            str((vix_snapshot or {}).get("message") or "").strip(),
+            *[
+                str((chain_summary or {}).get("message") or "").strip()
+                for chain_summary in option_chains.values()
+                if isinstance(chain_summary, dict)
+            ],
+        ]
+        market_data_available = bool(
+            not (spx_snapshot or {}).get("status_unavailable")
+            and not (vix_snapshot or {}).get("status_unavailable")
+            and all(not (chain_summary or {}).get("status_unavailable") for chain_summary in option_chains.values() if isinstance(chain_summary, dict))
+            and spx_intraday_candles is not None
         )
 
         apollo_context: Dict[str, Any] = {}
@@ -476,18 +361,27 @@ class OpenTradeManager:
             "now": now,
             "spx_snapshot": spx_snapshot,
             "vix_snapshot": vix_snapshot,
+            "spx_intraday_candles": spx_intraday_candles,
             "option_chains": option_chains,
             "prepared_option_chains": prepared_option_chains,
             "normalized_expiration_map": normalized_expiration_map,
             "apollo": apollo_context,
             "current_spx": current_spx,
             "current_vix": self._coerce_float((vix_snapshot or {}).get("Latest Value")),
+            "market_data_available": market_data_available,
+            "market_data_error": next((item for item in market_data_errors if item), ""),
         }
         with self._shared_context_cache_lock:
             self._shared_context_cache[cache_key] = {
                 "cached_at": now,
                 "context": copy.deepcopy(shared_context),
             }
+        metrics.record(
+            "OpenTradeManager shared context",
+            (perf_counter() - started) * 1000.0,
+            cache_hit=False,
+            detail=f"{caller_source}|{','.join(resolved_expiration_keys)}",
+        )
         return shared_context
 
     def _normalize_open_trade_expirations(
@@ -608,11 +502,14 @@ class OpenTradeManager:
         metrics = self._build_live_metrics(trade, current_underlying=current_underlying, current_vix=current_vix, shared_context=shared_context, now=now)
 
         if system_name == "Talos":
-            classification = self._classify_talos_trade(trade, metrics)
+            classification = self._classify_talos_trade(trade, metrics, shared_context, now)
             profile_label = resolve_trade_candidate_profile(trade)
         else:
             classification = self._classify_apollo_trade(trade, metrics, shared_context.get("apollo") or {}, now)
             profile_label = resolve_trade_candidate_profile(trade)
+
+        metrics["current_underlying_price"] = classification.get("effective_spx", metrics.get("current_underlying_price"))
+        metrics["distance_to_short"] = classification.get("effective_distance_to_short", metrics.get("distance_to_short"))
 
         record = {
             "trade_id": int(trade.get("id") or 0),
@@ -692,6 +589,15 @@ class OpenTradeManager:
             "next_trigger": classification["next_trigger"],
             "exit_plan_summary": classification.get("exit_plan_summary") or classification["next_trigger"],
             "exit_plan_gates": classification.get("exit_plan_gates") or [],
+            "current_spx_gate_display": classification.get("current_spx_gate_display") or self._format_number(metrics["current_underlying_price"]),
+            "gate_1_level_display": classification.get("gate_1_level_display") or "—",
+            "gate_2_level_display": classification.get("gate_2_level_display") or "—",
+            "gate_3_condition": classification.get("gate_3_condition") or "—",
+            "gate_4_condition": classification.get("gate_4_condition") or "—",
+            "next_active_gate_label": classification.get("next_active_gate_label") or "—",
+            "next_gate_contracts_display": classification.get("next_gate_contracts_display") or "0",
+            "triggered_gates_display": classification.get("triggered_gates_display") or "None",
+            "active_gate_key": classification.get("active_gate_key") or "",
             "trigger_source": classification["trigger_source"],
             "structure_trigger_fired": classification["structure_trigger_fired"],
             "vwap_trigger_fired": classification["vwap_trigger_fired"],
@@ -880,58 +786,243 @@ class OpenTradeManager:
             **action_plan,
         }
 
-    def _classify_talos_trade(self, trade: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
-        distance_to_short = float(metrics.get("distance_to_short") or 0.0)
-        distance_to_long = float(metrics.get("distance_to_long") or 0.0)
+    def _classify_talos_trade(self, trade: Dict[str, Any], metrics: Dict[str, Any], shared_context: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+        gate_state = self._build_talos_fortress_gate_state(trade, metrics, shared_context)
         current_structure = self._coerce_text(resolve_trade_system_name(trade), fallback="Talos")
         current_live_expected_move = self._coerce_float(metrics.get("current_live_expected_move"))
-        em_multiple = self._safe_divide(distance_to_short, current_live_expected_move)
-        short_watch_zone = em_multiple < self.TALOS_HEALTHY_EM_THRESHOLD
-        short_hard_stop = self._is_strike_breached(distance_to_short)
-        long_breach = self._is_long_stop_breached(distance_to_short=distance_to_short, distance_to_long=distance_to_long)
-        if long_breach or short_hard_stop or em_multiple < 1.0:
-            status = "Exit Now"
-            status_reason_code = "talos-em-exit-now"
-            reason = "Talos spread has breached its short or long stop and should be fully exited."
-        elif em_multiple < 1.2:
-            status = "Exit Partial"
-            status_reason_code = "talos-em-exit-partial"
-            reason = f"Talos spread is down to {em_multiple:.2f}x current same-day expected-move clearance and needs a partial exit."
-        elif em_multiple >= self.TALOS_HEALTHY_EM_THRESHOLD:
-            status = "Healthy"
-            status_reason_code = "talos-em-healthy"
-            reason = f"Talos spread retains {em_multiple:.2f}x current same-day expected-move clearance to the short strike."
-        elif em_multiple >= self.TALOS_WATCH_EM_THRESHOLD:
-            status = "Watch"
-            status_reason_code = "talos-em-watch"
-            reason = f"Talos spread has compressed to {em_multiple:.2f}x current same-day expected-move clearance and should be watched."
-        else:
-            status = "Exit Approaching"
-            status_reason_code = "talos-em-exit-approaching"
-            reason = f"Talos spread is down to {em_multiple:.2f}x current same-day expected-move clearance and is approaching exit territory."
+        em_multiple = self._safe_divide(gate_state["effective_distance_to_short"], current_live_expected_move)
+        next_due_gate = gate_state.get("next_due_gate")
+        next_active_gate = gate_state.get("next_active_gate")
 
-        action_plan = self._build_action_plan(status, int(metrics.get("remaining_contracts") or 0), metrics)
-        next_trigger, next_trigger_action = self._build_price_ladder_next_trigger(trade, metrics)
-        exit_plan_summary = self._build_exit_plan_summary(trade, metrics)
+        if next_due_gate is not None and gate_state["contracts_to_close"] > 0:
+            status = "Exit Partial"
+            status_reason_code = f"talos-{next_due_gate['gate_key']}-active"
+            reason = next_due_gate["reason"]
+        elif gate_state["triggered_gates"]:
+            status = "Watch"
+            status_reason_code = "talos-fortress-gates-progressing"
+            reason = f"Talos Fortress exit plan is active. Next gate: {gate_state['next_trigger']}"
+        else:
+            status = "Healthy"
+            status_reason_code = "talos-fortress-gates-healthy"
+            reason = f"Talos Fortress trade is waiting on {gate_state['next_trigger']}"
+
+        if gate_state["test_hook_label"] != "Live market":
+            reason = f"{reason} Test hook active: {gate_state['test_hook_label']}."
+
+        if str(trade.get("trade_mode") or "").strip().lower() == "simulated":
+            reason = f"Talos simulated Shared Supabase Journal position. {reason}"
+
+        action_type = ""
+        action_recommendation = "Watch"
+        if gate_state["contracts_to_close"] > 0:
+            action_type = "Close" if gate_state["contracts_to_close"] >= int(metrics.get("remaining_contracts") or 0) else "Reduce"
+            action_recommendation = f"Close {gate_state['contracts_to_close']} contract{'s' if gate_state['contracts_to_close'] != 1 else ''}"
+
+        pl_after_close = None
+        remaining_risk = None
+        current_close_price = self._coerce_float(metrics.get("current_close_price"), fallback=0.0) or 0.0
+        entry_credit = self._coerce_float(metrics.get("net_credit_per_contract"), fallback=0.0) or 0.0
+        max_loss = self._coerce_float(metrics.get("max_loss"), fallback=0.0) or 0.0
+        if gate_state["contracts_to_close"] > 0:
+            remaining_contracts = max(int(metrics.get("remaining_contracts") or 0) - gate_state["contracts_to_close"], 0)
+            closed_pl = round((entry_credit - current_close_price) * gate_state["contracts_to_close"] * 100.0, 2)
+            remaining_unrealized_pl = round((entry_credit - current_close_price) * remaining_contracts * 100.0, 2)
+            pl_after_close = round(closed_pl + remaining_unrealized_pl, 2)
+            remaining_risk = round(max(max_loss - closed_pl, 0.0), 2)
+
         return {
             "status": status,
             "thesis_status": "managed",
             "reason": reason,
             "status_reason_code": status_reason_code,
             "thesis_reason_code": "talos-governed",
-            "next_trigger": next_trigger,
-            "exit_plan_summary": exit_plan_summary,
-            "exit_plan_gates": self._build_exit_plan_gates(trade, metrics),
-            "trigger_source": next_trigger_action,
+            "next_trigger": gate_state["next_trigger"],
+            "exit_plan_summary": gate_state["next_trigger"],
+            "exit_plan_gates": gate_state["exit_plan_gates"],
+            "trigger_source": "talos-fortress-exit-gates",
             "current_structure_grade": current_structure,
             "status_em_multiple": em_multiple,
             "structure_trigger_fired": False,
             "vwap_trigger_fired": False,
-            "short_proximity_trigger_fired": short_watch_zone,
-            "long_proximity_trigger_fired": long_breach,
-            "final_stop_trigger_fired": bool(short_hard_stop or long_breach),
-            **action_plan,
+            "short_proximity_trigger_fired": bool(gate_state.get("gate_1_due") or gate_state.get("gate_2_due")),
+            "long_proximity_trigger_fired": bool(gate_state.get("gate_3_due")),
+            "final_stop_trigger_fired": bool(gate_state.get("gate_4_due")),
+            "action_recommendation": action_recommendation,
+            "action_type": action_type,
+            "contracts_to_close": gate_state["contracts_to_close"],
+            "pl_after_close": pl_after_close,
+            "remaining_risk": remaining_risk,
+            "critical_alert": bool(next_due_gate),
+            "current_spx_gate_display": gate_state["current_spx_display"],
+            "gate_1_level_display": gate_state["gate_1_level_display"],
+            "gate_2_level_display": gate_state["gate_2_level_display"],
+            "gate_3_condition": gate_state.get("gate_3_condition") or "2 consecutive 5-minute candles fully below short strike",
+            "gate_4_condition": gate_state.get("gate_4_condition") or "30 minutes below short strike",
+            "next_active_gate_label": gate_state["next_active_gate_label"],
+            "next_gate_contracts_display": str(gate_state["contracts_to_close"] if gate_state["contracts_to_close"] > 0 else gate_state["next_gate_contracts"]),
+            "triggered_gates_display": gate_state["triggered_gates_display"],
+            "active_gate_key": gate_state.get("active_gate_key") or "",
+            "effective_spx": gate_state["effective_spx"],
+            "effective_distance_to_short": gate_state["effective_distance_to_short"],
         }
+
+    def _build_talos_fortress_gate_state(self, trade: Dict[str, Any], metrics: Dict[str, Any], shared_context: Dict[str, Any]) -> Dict[str, Any]:
+        short_strike = self._coerce_float(trade.get("short_strike"), fallback=0.0) or 0.0
+        effective_spx = self._coerce_float(metrics.get("current_underlying_price"), fallback=0.0) or 0.0
+        test_hook = self.get_talos_gate_test_hook()
+        live_market_available = bool(shared_context.get("market_data_available", True))
+        test_hook_label = {
+            "live": "Live market",
+            "within15": "Within 15 points",
+            "within5": "Within 5 points",
+            "below2": "Below short strike for 2 full 5-minute candles",
+            "below30": "Below short strike for more than 30 minutes",
+        }.get(test_hook, "Live market")
+        if test_hook == "within15":
+            effective_spx = short_strike + self.TALOS_GATE_1_BUFFER_POINTS
+        elif test_hook == "within5":
+            effective_spx = short_strike + self.TALOS_GATE_2_BUFFER_POINTS
+        elif test_hook in {"below2", "below30"}:
+            effective_spx = short_strike - 1.0
+
+        effective_distance_to_short = self._compute_distance(effective_spx, strike=short_strike, is_call=False)
+        gate_1_level = short_strike + self.TALOS_GATE_1_BUFFER_POINTS
+        gate_2_level = short_strike + self.TALOS_GATE_2_BUFFER_POINTS
+        fired_gates = self._extract_talos_fired_gates(trade)
+        gates_stale = test_hook == "live" and not live_market_available
+        gate_1_due = False if gates_stale else effective_spx <= gate_1_level
+        gate_2_due = False if gates_stale else effective_spx <= gate_2_level
+        gate_3_due = False if gates_stale else (test_hook in {"below2", "below30"} or self._has_two_full_candles_below_short(shared_context.get("spx_intraday_candles"), short_strike))
+        gate_4_minutes = 0.0 if gates_stale else (float(self.TALOS_GATE_4_DURATION_MINUTES + 5) if test_hook == "below30" else self._continuous_minutes_below_short(shared_context.get("spx_intraday_candles"), short_strike))
+        gate_4_due = False if gates_stale else effective_spx < short_strike and gate_4_minutes > self.TALOS_GATE_4_DURATION_MINUTES
+
+        gates = [
+            {"gate_key": "gate_1", "label": self.TALOS_GATE_LABELS["gate_1"], "description": f"Close 25% when SPX <= {self._format_number(gate_1_level)}", "due_now": gate_1_due, "reason": f"Talos Gate 1 active: SPX is within 15 points of the short strike ({self._format_number(short_strike)}).", "trigger_value_display": self._format_number(gate_1_level)},
+            {"gate_key": "gate_2", "label": self.TALOS_GATE_LABELS["gate_2"], "description": f"Close 25% when SPX <= {self._format_number(gate_2_level)}", "due_now": gate_2_due, "reason": f"Talos Gate 2 active: SPX is within 5 points of the short strike ({self._format_number(short_strike)}).", "trigger_value_display": self._format_number(gate_2_level)},
+            {"gate_key": "gate_3", "label": self.TALOS_GATE_LABELS["gate_3"], "description": "Close 25% after 2 consecutive 5-minute candles fully below short strike", "due_now": gate_3_due, "reason": f"Talos Gate 3 active: 2 consecutive 5-minute candles printed fully below the short strike ({self._format_number(short_strike)}).", "trigger_value_display": "2 candles below short"},
+            {"gate_key": "gate_4", "label": self.TALOS_GATE_LABELS["gate_4"], "description": "Close 25% after more than 30 minutes below short strike", "due_now": gate_4_due, "reason": f"Talos Gate 4 active: SPX has remained below the short strike for more than 30 minutes ({gate_4_minutes:.0f} minutes).", "trigger_value_display": "> 30 minutes below short"},
+        ]
+
+        next_active_gate = next((gate for gate in gates if gate["gate_key"] not in fired_gates), None)
+        next_due_gate = next((gate for gate in gates if gate["gate_key"] not in fired_gates and gate["due_now"]), None)
+        remaining_contracts = max(int(metrics.get("remaining_contracts") or 0), 0)
+        contracts_to_close = self._resolve_talos_gate_close_quantity(remaining_contracts) if next_due_gate is not None else 0
+        next_gate_contracts = self._resolve_talos_gate_close_quantity(remaining_contracts) if next_active_gate is not None else 0
+        next_trigger = next_active_gate["description"] if next_active_gate is not None else "All Talos Fortress gates have already fired."
+        gate_3_condition = "2 consecutive 5-minute candles fully below short strike"
+        gate_4_condition = "30 minutes below short strike"
+        if gates_stale:
+            next_active_gate = None
+            next_due_gate = None
+            contracts_to_close = 0
+            next_gate_contracts = 0
+            next_trigger = "Talos Fortress exit gates are unavailable until Schwab market-data reconnect completes."
+            gate_3_condition = "Unavailable until Schwab market-data reconnect completes"
+            gate_4_condition = "Unavailable until Schwab market-data reconnect completes"
+        if next_due_gate is not None and contracts_to_close > 0:
+            next_trigger = f"{next_due_gate['label']}: close {contracts_to_close} contract{'s' if contracts_to_close != 1 else ''}."
+        return {
+            "effective_spx": effective_spx,
+            "effective_distance_to_short": effective_distance_to_short,
+            "current_spx_display": "Unavailable" if gates_stale else self._format_number(effective_spx),
+            "gate_1_level_display": self._format_number(gate_1_level),
+            "gate_2_level_display": self._format_number(gate_2_level),
+            "gate_1_due": gate_1_due,
+            "gate_2_due": gate_2_due,
+            "gate_3_due": gate_3_due,
+            "gate_4_due": gate_4_due,
+            "next_active_gate": next_active_gate,
+            "next_due_gate": next_due_gate,
+            "next_active_gate_label": "Unavailable" if gates_stale else (next_active_gate["label"] if next_active_gate is not None else "All gates fired"),
+            "next_gate_contracts": next_gate_contracts,
+            "contracts_to_close": contracts_to_close,
+            "next_trigger": next_trigger,
+            "exit_plan_gates": [
+                {
+                    "label": gate["label"],
+                    "trigger_value_display": gate["trigger_value_display"],
+                    "comparison": "<=",
+                    "quantity_to_close": self._resolve_talos_gate_close_quantity(remaining_contracts) if gate["gate_key"] not in fired_gates else 0,
+                    "quantity_to_close_display": str(self._resolve_talos_gate_close_quantity(remaining_contracts) if gate["gate_key"] not in fired_gates else 0),
+                    "executed": gate["gate_key"] in fired_gates,
+                    "due_now": False if gates_stale else bool(gate["due_now"] and gate["gate_key"] not in fired_gates),
+                    "state_key": "unavailable" if gates_stale else ("executed" if gate["gate_key"] in fired_gates else ("due" if gate["due_now"] else "pending")),
+                    "state_label": "Unavailable" if gates_stale else ("Triggered" if gate["gate_key"] in fired_gates else ("Due Now" if gate["due_now"] else "Pending")),
+                    "description": "Unavailable until Schwab market-data reconnect completes." if gates_stale else gate["description"],
+                }
+                for gate in gates
+            ],
+            "triggered_gates": sorted(fired_gates),
+            "triggered_gates_display": ", ".join(self.TALOS_GATE_LABELS[item] for item in self.TALOS_GATE_SEQUENCE if item in fired_gates) or "None",
+            "active_gate_key": "" if gates_stale else (next_due_gate or next_active_gate or {}).get("gate_key", ""),
+            "test_hook_label": test_hook_label,
+            "gate_3_condition": gate_3_condition,
+            "gate_4_condition": gate_4_condition,
+        }
+
+    def _resolve_talos_gate_close_quantity(self, remaining_contracts: int) -> int:
+        if remaining_contracts <= 0:
+            return 0
+        if remaining_contracts == 1:
+            return 1
+        return min(remaining_contracts, max(1, int(math.floor(remaining_contracts * 0.25))))
+
+    def _extract_talos_fired_gates(self, trade: Dict[str, Any]) -> set[str]:
+        fired_gates: set[str] = set()
+        automation_status = str(trade.get("automation_status") or "")
+        match = re.search(r"talos_exit_gates=([^|]+)", automation_status)
+        if match:
+            fired_gates.update(item.strip().lower() for item in str(match.group(1) or "").split(",") if item.strip().lower() in self.TALOS_GATE_SEQUENCE)
+        for event in trade.get("close_events") or []:
+            notes_exit = str((event or {}).get("notes_exit") or "")
+            gate_match = re.search(r"gate=(gate_\d)", notes_exit)
+            if gate_match and gate_match.group(1) in self.TALOS_GATE_SEQUENCE:
+                fired_gates.add(gate_match.group(1))
+        return fired_gates
+
+    def update_talos_trade_gate_state(self, trade: Dict[str, Any], gate_key: str) -> Dict[str, Any]:
+        normalized_gate_key = str(gate_key or "").strip().lower()
+        if normalized_gate_key not in self.TALOS_GATE_SEQUENCE:
+            return dict(trade)
+        fired_gates = sorted(self._extract_talos_fired_gates(trade) | {normalized_gate_key})
+        automation_status = str(trade.get("automation_status") or "").strip()
+        parts = [segment for segment in automation_status.split("|") if segment and not segment.startswith("talos_exit_gates=")]
+        parts.append(f"talos_exit_gates={','.join(fired_gates)}")
+        updated_trade = dict(trade)
+        updated_trade["automation_status"] = "|".join(parts)
+        return updated_trade
+
+    def _safe_intraday_candles(self, ticker: str, *, caller_source: str):
+        try:
+            return self.market_data_service.get_same_day_intraday_candles(
+                ticker,
+                interval_minutes=5,
+                query_type=f"{caller_source}:talos-5m",
+            )
+        except Exception as exc:  # pragma: no cover - defensive provider handling
+            LOGGER.warning("Unable to retrieve %s intraday candles for Talos gate evaluation: %s", ticker, exc)
+            return None
+
+    def _has_two_full_candles_below_short(self, frame: Any, short_strike: float) -> bool:
+        if frame is None or not hasattr(frame, "empty") or frame.empty:
+            return False
+        normalized = frame.sort_values("Datetime").dropna(subset=["Datetime", "High"]).tail(2)
+        if len(normalized.index) < 2:
+            return False
+        return bool(all(float(row.High) < short_strike for row in normalized.itertuples()))
+
+    def _continuous_minutes_below_short(self, frame: Any, short_strike: float) -> float:
+        if frame is None or not hasattr(frame, "empty") or frame.empty:
+            return 0.0
+        normalized = frame.sort_values("Datetime").dropna(subset=["Datetime", "Close"])
+        consecutive = 0
+        for row in reversed(list(normalized.itertuples())):
+            if float(row.Close) < short_strike:
+                consecutive += 1
+                continue
+            break
+        return float(consecutive * 5)
 
     def _process_daily_notifications(
         self,
@@ -1742,8 +1833,48 @@ class OpenTradeManager:
     def _safe_snapshot(self, ticker: str, *, query_type: str) -> Dict[str, Any]:
         try:
             return self.market_data_service.get_latest_snapshot(ticker, query_type=query_type)
-        except MarketDataError:
-            return {"status_unavailable": True}
+        except (MarketDataError, ProviderAuthRequiredError, ProviderReauthenticationRequiredError, ProviderError, Exception) as exc:
+            LOGGER.warning("Unable to retrieve %s snapshot for open-trade management: %s", ticker, exc)
+            return {"status_unavailable": True, "message": str(exc)}
+
+    def _safe_option_chain_summary(self, expiration_date: date, *, caller_source: str) -> Dict[str, Any]:
+        try:
+            return self.options_chain_service.get_spx_option_chain_summary(
+                expiration_date,
+                caller_context=caller_source,
+                log_normalization=False,
+            )
+        except Exception as exc:
+            LOGGER.warning("Unable to retrieve SPX option chain for %s during open-trade management: %s", expiration_date.isoformat(), exc)
+            return {
+                "status_unavailable": True,
+                "message": str(exc),
+                "expiration_date": expiration_date.isoformat(),
+                "puts": [],
+                "calls": [],
+            }
+
+    def _build_market_data_unavailable_payload(self, *, now: datetime, error: str) -> Dict[str, Any]:
+        return {
+            "evaluated_at": now.isoformat(),
+            "evaluated_at_display": self._format_datetime(now),
+            "open_trade_count": 0,
+            "alerts_sent": 0,
+            "alert_failures": [],
+            "notifications_enabled": False,
+            "global_notification_settings": [],
+            "last_morning_snapshot_date": "",
+            "last_eod_summary_date": "",
+            "live_expected_move_display": "Unavailable",
+            "header_market_snapshots": {
+                "^GSPC": {"status_unavailable": True, "message": error},
+                "^VIX": {"status_unavailable": True, "message": error},
+            },
+            "market_data_available": False,
+            "market_data_error": str(error or "Schwab market data reconnect required."),
+            "status_counts": self._build_status_counts([]),
+            "records": [],
+        }
 
     def _coerce_trade_expiration(self, trade: Dict[str, Any]) -> date | None:
         return parse_date_value(trade.get("expiration_date"))

@@ -15,7 +15,7 @@
                 active_page='performance',
                 page_heading='Performance',
                 page_copy='Visual dashboard for trade behavior, risk, and progression at a glance.',
-                page_meta='Chart-first command view for retained Apollo and Talos performance.',
+                page_meta='Chart-first command view for retained Talos performance only in hosted mode.' if hosted_mode else 'Chart-first command view for retained Apollo and Talos performance.',
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
                 menu_status=menu_status,
@@ -133,7 +133,7 @@
 
         <section class="panel performance-learning-panel">
             <div class="performance-panel-header">
-                <h2>{% if hosted_mode %}Talos 2.1.2 Hosted Learning Metrics{% else %}Performance Learning Metrics{% endif %}</h2>
+                <h2>{% if hosted_mode %}Talos 3.10 Hosted Learning Metrics{% else %}Performance Learning Metrics{% endif %}</h2>
                 <span class="subtle">Decision-useful trade-quality analytics derived from current stored trade history, timestamps, close events, VIX, and EM metadata.</span>
             </div>
 

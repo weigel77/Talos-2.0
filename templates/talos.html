@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Talos | {{ app_identity.display_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    {% from '_delphi_header_macros.html' import render_delphi_header with context %}
+    <main class="page-shell">
+        <section class="hero-card delphi-header-card delphi-shared-header delphi-header-card-subpage">
+            {{ render_delphi_header(
+                active_page='talos',
+                page_heading='Talos',
+                page_copy='Talos 3.10 enforces the approved open window, reuses cached Apollo market context, and stages long-first execution previews under hard safety gates.',
+                page_meta='Talos 3.10 master operating mode control surface.',
+                page_kicker=app_identity.page_kicker,
+                page_version=app_identity.version_label,
+                menu_status=menu_status,
+            ) }}
+
+            {% if error_message %}
+                <div class="message message-error">{{ error_message }}</div>
+            {% endif %}
+
+            {% if info_message %}
+                <div class="message message-{{ info_message.level|default('info') }}">{{ info_message.text }}</div>
+            {% endif %}
+        </section>
+
+        {% set primary_open_trade = namespace(item=None) %}
+        {% set primary_monitor_record = namespace(item=None) %}
+        {% set open_trade_rows = namespace(count=0) %}
+        {% set has_open_preview = talos_payload.real_execution.open_preview and (talos_payload.real_execution.open_preview.contracts or talos_payload.real_execution.open_preview.summary or talos_payload.real_execution.open_preview.short_strike) %}
+        {% set has_close_preview = talos_payload.real_execution.close_preview and (talos_payload.real_execution.close_preview.contracts or talos_payload.real_execution.close_preview.summary or talos_payload.real_execution.close_preview.short_strike) %}
+        {% set system_checks_open = has_open_preview or has_close_preview or talos_payload.real_execution.last_open_reason or talos_payload.real_execution.last_close_reason %}
+        {% for trade in talos_payload.recent_trades %}
+            {% if trade.status in ['Open', 'Reduced'] and primary_open_trade.item is none %}
+                {% set primary_open_trade.item = trade %}
+            {% endif %}
+        {% endfor %}
+        {% for record in talos_payload.monitor_loop.records %}
+            {% if primary_monitor_record.item is none %}
+                {% set primary_monitor_record.item = record %}
+            {% endif %}
+        {% endfor %}
+        {% set current_action = primary_monitor_record.item.action_recommendation if primary_monitor_record.item else 'Monitoring' %}
+        {% set current_action_lower = current_action|lower %}
+        {% if 'exit' in current_action_lower or 'close' in current_action_lower %}
+            {% set current_action_tone = 'exit' %}
+        {% elif 'candidate' in current_action_lower or 'search' in current_action_lower %}
+            {% set current_action_tone = 'candidate' %}
+        {% elif 'watch' in current_action_lower %}
+            {% set current_action_tone = 'watch' %}
+        {% else %}
+            {% set current_action_tone = 'monitoring' %}
+        {% endif %}
+
+        <section class="panel trade-dashboard-panel">
+            <div class="result-header">
+                <div>
+                    <h2>Master Operating Mode</h2>
+                </div>
+            </div>
+
+            <form method="post" action="{{ talos_update_url }}" class="trade-import-form">
+                <div class="talos-master-mode-grid">
+                    {% for option in talos_payload.master_mode.options %}
+                        <button
+                            type="submit"
+                            name="master_mode"
+                            value="{{ option.value }}"
+                            class="talos-mode-tile talos-mode-tile-{{ option.tone }} {% if talos_payload.master_mode.current == option.value %}talos-mode-tile-selected{% else %}talos-mode-tile-unselected{% endif %}"
+                            aria-pressed="{{ 'true' if talos_payload.master_mode.current == option.value else 'false' }}"
+                        >
+                            <span class="talos-mode-tile-label">{{ option.label }}</span>
+                            <span class="talos-mode-tile-copy">
+                                {% if option.value == 'INACTIVE' %}
+                                    Dormant diagnostics only.
+                                {% elif option.value == 'SIMULATED' %}
+                                    Full Talos logic with simulated trades only.
+                                {% else %}
+                                    Execution auth standby only. Real orders remain blocked.
+                                {% endif %}
+                            </span>
+                        </button>
+                    {% endfor %}
+                </div>
+                <div class="message message-info message-inline talos-master-mode-banner talos-master-mode-banner-{{ talos_payload.master_mode.tone }}">
+                    <strong>{{ talos_payload.master_mode.label }}</strong> {{ talos_payload.master_mode.description }}
+                </div>
+
+                <details class="apollo-inline-details talos-advanced-details">
+                    <summary class="apollo-inline-summary">Advanced Fortress Settings</summary>
+                    <div class="trade-import-grid talos-advanced-grid">
+                        {% for row in talos_payload.parameters.rows %}
+                            <div class="field-group">
+                                <label for="{{ row.key }}">{{ row.label }}</label>
+                                <input id="{{ row.key }}" name="{{ row.key }}" type="number" step="0.1" value="{{ talos_payload.parameters.values[row.key] }}">
+                            </div>
+                        {% endfor %}
+                        <div class="field-group">
+                            <label for="gate_test_scenario">Gate Test Scenario</label>
+                            <select id="gate_test_scenario" name="gate_test_scenario">
+                                {% for option in talos_payload.gate_test.options %}
+                                    <option value="{{ option.value }}" {% if talos_payload.gate_test.current == option.value %}selected{% endif %}>{{ option.label }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+                    <div class="actions trade-form-actions">
+                        <button type="submit">Save Talos Mode + Fortress Settings</button>
+                    </div>
+                </details>
+            </form>
+        </section>
+
+        <section class="panel trade-dashboard-panel talos-health-panel">
+            <div class="talos-health-strip">
+                {% for item in talos_payload.engine_health %}
+                    <article class="talos-health-item talos-health-item-{{ item.status }}">
+                        <span class="talos-health-dot talos-health-dot-{{ item.status }}"></span>
+                        <span class="talos-health-label">{{ item.label }}</span>
+                        <strong class="talos-health-value">{{ item.display }}</strong>
+                    </article>
+                {% endfor %}
+            </div>
+        </section>
+
+        <section class="panel trade-dashboard-panel talos-timing-panel">
+            <div class="result-header">
+                <div>
+                    <h2>Timing Status</h2>
+                </div>
+            </div>
+            <div class="talos-timing-card talos-timing-card-{{ talos_payload.timing_status.tone }}">
+                <div>
+                    <p class="summary-label">Autonomous Open Window</p>
+                    <p class="talos-timing-value">{{ talos_payload.timing_status.label }}</p>
+                </div>
+                <div>
+                    <p class="summary-label">Minutes To Close</p>
+                    <p class="summary-value">{{ talos_payload.timing_status.minutes_to_close if talos_payload.timing_status.minutes_to_close is not none else '—' }}</p>
+                </div>
+                <div class="talos-timing-detail">{{ talos_payload.timing_status.details }}</div>
+            </div>
+        </section>
+
+        <section class="panel trade-dashboard-panel talos-risk-panel-compact">
+            <div class="result-header">
+                <div>
+                    <h2>Account / Risk</h2>
+                </div>
+                <div class="actions trade-form-actions talos-action-row talos-account-actions">
+                    {% if talos_payload.account.execution_connected %}
+                        <form method="post" action="{{ execution_auth_logout_url }}">
+                            <button type="submit" class="button-link button-link-secondary">Disconnect Execution Auth</button>
+                        </form>
+                    {% else %}
+                        <a class="button-link" href="{{ execution_auth_login_url }}">Connect Schwab Execution</a>
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="talos-risk-strip">
+                <article class="summary-card"><p class="summary-label">Market Data Schwab</p><p class="summary-value">{{ 'Connected' if market_data_status.connected else 'Reconnect Required' }}</p></article>
+                <article class="summary-card"><p class="summary-label">Execution Schwab</p><p class="summary-value">{{ 'Connected' if talos_payload.account.execution_connected else 'Reconnect Required' }}</p></article>
+                <article class="summary-card"><p class="summary-label">Account Value</p><p class="summary-value">{{ talos_payload.account.account_value_display }}</p></article>
+                <article class="summary-card"><p class="summary-label">Remaining Black Swan Capacity</p><p class="summary-value">{{ talos_payload.account.remaining_capacity_display }}</p></article>
+                <article class="summary-card"><p class="summary-label">Max Contracts Now</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.max_contracts_display }}</p></article>
+            </div>
+
+            {% if talos_payload.account.block_reason %}
+                <div class="message message-warning message-inline">{{ talos_payload.account.block_reason }}</div>
+            {% endif %}
+            {% if talos_payload.account.execution_configuration_message %}
+                <div class="message message-warning message-inline">{{ talos_payload.account.execution_configuration_message }}</div>
+            {% endif %}
+
+            <details class="apollo-inline-details talos-advanced-details">
+                <summary class="apollo-inline-summary">Advanced Risk Details</summary>
+                <div class="summary-grid talos-operator-grid">
+                    <article class="summary-card"><p class="summary-label">Execution Account</p><p class="summary-value">{{ talos_payload.account.execution_account_name }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Execution Config</p><p class="summary-value">{{ 'Configured' if talos_payload.account.execution_account_configured else 'Missing' }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Account Source</p><p class="summary-value">{{ talos_payload.account.account_source }}</p></article>
+                    <article class="summary-card"><p class="summary-label">5% Black Swan Cap</p><p class="summary-value">{{ talos_payload.account.max_black_swan_allocation_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Open Exposure Counted</p><p class="summary-value">{{ talos_payload.account.open_exposure_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Same-Day Exposure Ignored</p><p class="summary-value">{{ talos_payload.account.ignored_same_day_exposure_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Execution Detail</p><p class="summary-value">{{ talos_payload.account.execution_status_meta }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Market Data Detail</p><p class="summary-value">{{ market_data_status.status_meta }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Token Expiration</p><p class="summary-value">{{ talos_payload.account.token_expiration_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Buying Power</p><p class="summary-value">{{ talos_payload.account.buying_power_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Execution Account</p><p class="summary-value">{{ talos_payload.account.execution_account_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Account Timestamp</p><p class="summary-value">{{ talos_payload.account.timestamp_display }}</p></article>
+                </div>
+                {% if talos_payload.account.manual_override_enabled %}
+                    <form method="post" action="{{ talos_update_url }}" class="talos-manual-account-form">
+                        <div class="field-group">
+                            <label for="manual_account_value">Manual Account Value</label>
+                            <input id="manual_account_value" name="manual_account_value" type="number" min="1" step="0.01" value="{{ talos_payload.account.manual_account_value_input }}">
+                        </div>
+                        <button type="submit" class="button-link button-link-secondary">Save Manual Value</button>
+                    </form>
+                {% endif %}
+                <div class="summary-grid trade-summary-grid">
+                    <article class="summary-card"><p class="summary-label">Token File Exists</p><p class="summary-value">{{ 'Yes' if execution_auth_debug.token_file_exists else 'No' }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Token Loaded</p><p class="summary-value">{{ 'Yes' if execution_auth_debug.token_loaded else 'No' }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Token Valid</p><p class="summary-value">{{ 'Yes' if execution_auth_debug.token_valid else 'No' }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Access Token Loaded</p><p class="summary-value">{{ 'Yes' if execution_auth_debug.access_token_loaded else 'No' }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Refresh Token Loaded</p><p class="summary-value">{{ 'Yes' if execution_auth_debug.refresh_token_loaded else 'No' }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Auth State</p><p class="summary-value">{{ execution_auth_debug.auth_state }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Last Auth Error</p><p class="summary-value">{{ execution_auth_debug.last_auth_error }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Account Fetch Status</p><p class="summary-value">{{ execution_auth_debug.account_fetch_status }}</p></article>
+                </div>
+            </details>
+        </section>
+
+        <section class="panel trade-dashboard-panel talos-decision-panel">
+            <div class="result-header">
+                <div>
+                    <h2>Decision Engine</h2>
+                </div>
+            </div>
+
+            <div class="talos-trade-card">
+                <div class="talos-trade-card-primary">
+                    <div class="talos-trade-card-headline">
+                        <p class="summary-label">Current Decision</p>
+                        <h3>{{ talos_payload.decision_engine.decision_label }}</h3>
+                    </div>
+                    <div class="talos-trade-card-spread">
+                        <p class="summary-label">Candidate Spread</p>
+                        <p class="talos-trade-card-spread-value">{{ talos_payload.decision_engine.candidate.short_strike }} / {{ talos_payload.decision_engine.candidate.long_strike }} put spread</p>
+                    </div>
+                </div>
+                <div class="talos-trade-card-metrics">
+                    <article class="summary-card"><p class="summary-label">Credit</p><p class="summary-value">{{ talos_payload.decision_engine.candidate.premium_per_contract }}</p></article>
+                    <article class="summary-card"><p class="summary-label">EM Multiple</p><p class="summary-value">{{ talos_payload.decision_engine.candidate.em_multiple }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Distance to Short</p><p class="summary-value">{{ talos_payload.decision_engine.candidate.distance_to_short }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Contracts Selected</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.contracts_selected_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Remaining Capacity After Trade</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.remaining_capacity_after_trade_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Expiration</p><p class="summary-value">{{ talos_payload.decision_engine.candidate.expiration_date }}</p></article>
+                </div>
+                <div class="message message-info message-inline talos-trade-card-reason">
+                    <strong>Reason:</strong> {{ talos_payload.decision_engine.reason }}
+                </div>
+            </div>
+
+            <details class="apollo-inline-details talos-advanced-details">
+                <summary class="apollo-inline-summary">Advanced Decision Details</summary>
+                <div class="summary-grid talos-operator-grid">
+                    <article class="summary-card"><p class="summary-label">Account Value</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.account_value_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Projected Exposure After Trade</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.projected_exposure_after_trade_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Black Swan / Contract</p><p class="summary-value">{{ talos_payload.decision_engine.candidate.projected_black_swan_loss_per_contract }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Open Exposure Counted</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.open_exposure_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Same-Day Exposure Ignored</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.ignored_same_day_exposure_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Remaining Capacity</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.remaining_capacity_display }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Theoretical Max Loss</p><p class="summary-value">{{ talos_payload.decision_engine.sizing.projected_total_theoretical_loss_display }}</p></article>
+                </div>
+                {% if talos_payload.candidate.rationale %}
+                    <ul class="apollo-detail-list apollo-detail-list-tight">
+                        {% for item in talos_payload.candidate.rationale %}
+                            <li>{{ item }}</li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+            </details>
+        </section>
+
+        <section class="panel trade-dashboard-panel talos-monitor-panel talos-monitor-panel-{{ current_action_tone }}">
+            <div class="result-header">
+                <div>
+                    <h2>Autonomous Monitor</h2>
+                </div>
+            </div>
+
+            <div class="talos-monitor-grid">
+                <article class="summary-card"><p class="summary-label">Last Run</p><p class="summary-value management-summary-value">{{ talos_payload.monitor_loop.last_run_display }}</p></article>
+                <article class="summary-card"><p class="summary-label">Market Status</p><p class="summary-value">{{ talos_payload.monitor_loop.market_status }}</p></article>
+                <article class="summary-card"><p class="summary-label">Open Talos Positions</p><p class="summary-value">{{ talos_payload.monitor_loop.evaluated_trade_count }}</p></article>
+                <article class="summary-card"><p class="summary-label">SPX</p><p class="summary-value">{{ talos_payload.monitor_loop.current_spx_display }}</p></article>
+                <article class="summary-card"><p class="summary-label">VIX</p><p class="summary-value">{{ talos_payload.monitor_loop.current_vix_display }}</p></article>
+                <article class="summary-card"><p class="summary-label">Delta Path</p><p class="summary-value">{{ talos_payload.monitor_loop.last_delta_reason or 'full-recompute' }}</p></article>
+                <article class="summary-card talos-monitor-action-card">
+                    <p class="summary-label">Current Action</p>
+                    <p class="summary-value talos-monitor-action talos-monitor-action-{{ current_action_tone }}">{{ current_action }}</p>
+                </article>
+                <article class="summary-card"><p class="summary-label">Next Scheduled Action</p><p class="summary-value">{{ primary_monitor_record.item.next_active_gate_label or primary_monitor_record.item.next_trigger if primary_monitor_record.item else talos_payload.monitor_loop.market_status }}</p></article>
+            </div>
+        </section>
+
+        <section class="panel trade-dashboard-panel">
+            <div class="result-header">
+                <div>
+                    <h2>Fortress Exit Gates</h2>
+                </div>
+            </div>
+
+            {% if primary_open_trade.item %}
+                {% set triggered_gates = primary_open_trade.item.triggered_gates %}
+                {% set all_gates_complete = primary_open_trade.item.next_active_gate == 'All gates fired' %}
+                {% set gates_unavailable = primary_open_trade.item.next_active_gate == 'Unavailable' %}
+                {% set gate_1_status = 'Completed' if all_gates_complete and 'Gate 1' in triggered_gates else ('Triggered' if 'Gate 1' in triggered_gates else ('Armed' if primary_open_trade.item.next_active_gate == 'Gate 1' and primary_open_trade.item.next_gate_contracts != '0' else ('Unavailable' if gates_unavailable else 'Waiting'))) %}
+                {% set gate_2_status = 'Completed' if all_gates_complete and 'Gate 2' in triggered_gates else ('Triggered' if 'Gate 2' in triggered_gates else ('Armed' if primary_open_trade.item.next_active_gate == 'Gate 2' and primary_open_trade.item.next_gate_contracts != '0' else ('Unavailable' if gates_unavailable else 'Waiting'))) %}
+                {% set gate_3_status = 'Completed' if all_gates_complete and 'Gate 3' in triggered_gates else ('Triggered' if 'Gate 3' in triggered_gates else ('Armed' if primary_open_trade.item.next_active_gate == 'Gate 3' and primary_open_trade.item.next_gate_contracts != '0' else ('Unavailable' if gates_unavailable else 'Waiting'))) %}
+                {% set gate_4_status = 'Completed' if all_gates_complete and 'Gate 4' in triggered_gates else ('Triggered' if 'Gate 4' in triggered_gates else ('Armed' if primary_open_trade.item.next_active_gate == 'Gate 4' and primary_open_trade.item.next_gate_contracts != '0' else ('Unavailable' if gates_unavailable else 'Waiting'))) %}
+                <div class="talos-gate-strip">
+                    <article class="summary-card"><p class="summary-label">Current SPX</p><p class="summary-value">{{ primary_open_trade.item.current_spx }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Short Strike</p><p class="summary-value">{{ primary_open_trade.item.short_strike }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Next Active Gate</p><p class="summary-value">{{ primary_open_trade.item.next_active_gate }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Contracts to Close</p><p class="summary-value">{{ primary_open_trade.item.next_gate_contracts }}</p></article>
+                </div>
+                <div class="table-wrap trade-table-wrap talos-gate-table-wrap">
+                    <table class="talos-gate-table">
+                        <thead>
+                            <tr><th>Gate</th><th>Trigger</th><th>Status</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr title="Trigger level {{ primary_open_trade.item.gate_1_level }}">
+                                <td>Gate 1</td>
+                                <td>SPX &lt;= short +15</td>
+                                <td><span class="talos-gate-state talos-gate-state-{{ gate_1_status|lower|replace(' ', '-') }}">{{ gate_1_status }}</span></td>
+                            </tr>
+                            <tr title="Trigger level {{ primary_open_trade.item.gate_2_level }}">
+                                <td>Gate 2</td>
+                                <td>SPX &lt;= short +5</td>
+                                <td><span class="talos-gate-state talos-gate-state-{{ gate_2_status|lower|replace(' ', '-') }}">{{ gate_2_status }}</span></td>
+                            </tr>
+                            <tr title="{{ primary_open_trade.item.gate_3_condition }}">
+                                <td>Gate 3</td>
+                                <td>2 candles below short</td>
+                                <td><span class="talos-gate-state talos-gate-state-{{ gate_3_status|lower|replace(' ', '-') }}">{{ gate_3_status }}</span></td>
+                            </tr>
+                            <tr title="{{ primary_open_trade.item.gate_4_condition }}">
+                                <td>Gate 4</td>
+                                <td>30 mins below short</td>
+                                <td><span class="talos-gate-state talos-gate-state-{{ gate_4_status|lower|replace(' ', '-') }}">{{ gate_4_status }}</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            {% else %}
+                <div class="message message-{{ talos_payload.gate_status.tone }} message-inline">{{ talos_payload.gate_status.message }}</div>
+            {% endif %}
+        </section>
+
+        <section class="panel trade-dashboard-panel talos-positions-panel">
+            <div class="result-header">
+                <div>
+                    <h2>Open Talos Positions</h2>
+                </div>
+                <div class="actions trade-form-actions talos-action-row">
+                    <a class="button-link button-link-secondary" href="{{ talos_trade_log_url }}">Open Talos Journal</a>
+                    <a class="button-link button-link-secondary" href="{{ talos_trade_log_url }}">View Full Trade History</a>
+                </div>
+            </div>
+
+            {% if primary_open_trade.item %}
+                <div class="table-wrap trade-table-wrap talos-open-positions-wrap">
+                    <table class="talos-open-positions-table">
+                        <thead>
+                            <tr><th>Trade #</th><th>Status</th><th>Gate</th><th>Profile</th><th>Strikes</th><th>Qty Remaining</th><th>SPX</th><th>Next Gate</th><th>Gate Qty</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for trade in talos_payload.recent_trades %}
+                                {% if trade.status in ['Open', 'Reduced'] and open_trade_rows.count < 3 %}
+                                    {% set management_status = trade.management_status|lower %}
+                                    {% set action_status = trade.action_recommendation|lower %}
+                                    {% if 'exit' in management_status or 'close' in action_status %}
+                                        {% set trade_tone = 'exit' %}
+                                    {% elif 'watch' in management_status or 'watch' in action_status %}
+                                        {% set trade_tone = 'watch' %}
+                                    {% else %}
+                                        {% set trade_tone = 'healthy' %}
+                                    {% endif %}
+                                    <tr class="talos-trade-row talos-trade-row-{{ trade.trade_mode_key }} talos-open-position-row talos-open-position-row-{{ trade_tone }}">
+                                        <td>{{ trade.trade_number }}</td>
+                                        <td><span class="talos-status-pill talos-status-pill-{{ trade_tone }}">{{ trade.management_status }}</span></td>
+                                        <td>{{ trade.gate_progress_display }}</td>
+                                        <td>{{ trade.candidate_profile }}</td>
+                                        <td>{{ trade.strike_pair }}</td>
+                                        <td>{{ trade.contracts }}</td>
+                                        <td>{{ trade.current_spx }}</td>
+                                        <td>{{ trade.next_active_gate }}</td>
+                                        <td>{{ trade.next_gate_contracts }}</td>
+                                    </tr>
+                                    {% set open_trade_rows.count = open_trade_rows.count + 1 %}
+                                {% endif %}
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% else %}
+                <div class="message message-info message-inline">No open Talos positions are on the journal right now.</div>
+            {% endif %}
+        </section>
+
+        <section class="panel trade-dashboard-panel">
+            <details class="apollo-inline-details talos-system-checks-shell" {% if system_checks_open %}open{% endif %}>
+                <summary class="apollo-inline-summary">Advanced System Checks</summary>
+                {% if talos_payload.real_execution.status_snapshot.critical_message %}
+                    <div class="message message-error message-inline">{{ talos_payload.real_execution.status_snapshot.critical_message }}</div>
+                {% endif %}
+                <div class="actions trade-form-actions talos-action-row talos-system-checks-row">
+                    <form method="post" action="{{ talos_simulated_open_check_url }}">
+                        <button type="submit">Force Simulated Open Check</button>
+                    </form>
+                    <form method="post" action="{{ talos_simulated_close_check_url }}">
+                        <button type="submit" class="button-link button-link-secondary">Run Simulated Close Check Now</button>
+                    </form>
+                    <form method="post" action="{{ talos_real_open_check_url }}" class="talos-manual-account-form talos-real-check-form {% if talos_payload.master_mode.current != 'ACTIVE' %}talos-control-disabled{% endif %}">
+                        <div class="field-group">
+                            <label for="real_order_confirmation_text_open">Real Order Confirmation</label>
+                            <input id="real_order_confirmation_text_open" name="real_order_confirmation_text" type="text" placeholder="ENABLE TALOS REAL ORDER">
+                        </div>
+                        <button type="submit" class="button-link button-link-secondary">Force Real Open Check</button>
+                    </form>
+                    <form method="post" action="{{ talos_real_close_check_url }}" class="talos-manual-account-form talos-real-check-form {% if talos_payload.master_mode.current != 'ACTIVE' %}talos-control-disabled{% endif %}">
+                        <div class="field-group">
+                            <label for="real_order_confirmation_text_close">Real Close Confirmation</label>
+                            <input id="real_order_confirmation_text_close" name="real_order_confirmation_text" type="text" placeholder="ENABLE TALOS REAL ORDER">
+                        </div>
+                        <div class="field-group">
+                            <label for="manual_close_override">Manual Close Override</label>
+                            <select id="manual_close_override" name="manual_close_override">
+                                <option value="false" selected>No</option>
+                                <option value="true">Yes</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="button-link button-link-secondary">Run Real Close Check Now</button>
+                    </form>
+                </div>
+
+                {% if talos_payload.real_execution.last_open_reason %}
+                    <div class="message message-warning message-inline">{{ talos_payload.real_execution.last_open_reason }}</div>
+                {% endif %}
+                {% if has_open_preview %}
+                    <details class="apollo-inline-details talos-preview-shell" open>
+                        <summary class="apollo-inline-summary">Real open order preview</summary>
+                        {% set open_status = talos_payload.real_execution.status_snapshot.open if talos_payload.real_execution.status_snapshot.open is defined else {} %}
+                        {% set open_preview_state = talos_payload.real_execution.open_preview.execution_state or ('BLOCKED' if talos_payload.real_execution.open_preview.execution_blocked_message else '') or open_status.state or 'PREVIEW' %}
+                        {% set open_preview_routing = talos_payload.real_execution.open_preview.routing_readiness or ('Blocked' if talos_payload.real_execution.open_preview.execution_blocked_message else '') or open_status.state or 'Ready' %}
+                        {% set open_preview_exposure = talos_payload.real_execution.open_preview.estimated_exposure_display or talos_payload.real_execution.open_preview.projected_total_black_swan_loss_display or ((talos_payload.real_execution.open_preview.estimated_contracts ~ ' contracts') if talos_payload.real_execution.open_preview.estimated_contracts else '') or '—' %}
+                        {% if talos_payload.real_execution.open_preview.execution_blocked_message %}
+                            <div class="message message-warning message-inline">{{ talos_payload.real_execution.open_preview.execution_blocked_message }}</div>
+                        {% endif %}
+                        <div class="talos-badge-row">
+                            {% for badge in talos_payload.real_execution.open_preview.status_badges or [] %}
+                                <span class="talos-ui-badge talos-ui-badge-{{ badge.tone }}">{{ badge.label }}</span>
+                            {% endfor %}
+                        </div>
+                        <div class="summary-grid talos-operator-grid">
+                            <article class="summary-card"><p class="summary-label">State</p><p class="summary-value">{{ open_preview_state }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Method</p><p class="summary-value">{{ talos_payload.real_execution.open_preview.preferred_method }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Contracts</p><p class="summary-value">{{ talos_payload.real_execution.open_preview.contracts }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Expiration</p><p class="summary-value">{{ talos_payload.real_execution.open_preview.expiration_date }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Strikes</p><p class="summary-value">{{ talos_payload.real_execution.open_preview.short_strike }} / {{ talos_payload.real_execution.open_preview.long_strike }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Net Credit</p><p class="summary-value">{{ talos_payload.real_execution.open_preview.limit_price_display }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Estimated Exposure</p><p class="summary-value">{{ open_preview_exposure }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Routing</p><p class="summary-value">{{ open_preview_routing }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Account Source</p><p class="summary-value">{{ talos_payload.real_execution.open_preview.account_source }}</p></article>
+                        </div>
+                        <div class="message message-info message-inline">{{ talos_payload.real_execution.open_preview.routing_readiness_detail or talos_payload.real_execution.open_preview.execution_blocked_message or open_status.message or 'Routing guards are still evaluating this preview.' }}</div>
+                        <div class="message message-info message-inline">{{ talos_payload.real_execution.open_preview.summary }}</div>
+                    </details>
+                {% endif %}
+                {% if talos_payload.real_execution.last_close_reason %}
+                    <div class="message message-warning message-inline">{{ talos_payload.real_execution.last_close_reason }}</div>
+                {% endif %}
+                {% if has_close_preview %}
+                    <details class="apollo-inline-details talos-preview-shell" open>
+                        <summary class="apollo-inline-summary">Real close order preview</summary>
+                        {% set close_status = talos_payload.real_execution.status_snapshot.close if talos_payload.real_execution.status_snapshot.close is defined else {} %}
+                        {% set close_preview_state = talos_payload.real_execution.close_preview.execution_state or close_status.state or 'PREVIEW' %}
+                        <div class="talos-badge-row">
+                            {% for badge in talos_payload.real_execution.close_preview.status_badges or [] %}
+                                <span class="talos-ui-badge talos-ui-badge-{{ badge.tone }}">{{ badge.label }}</span>
+                            {% endfor %}
+                        </div>
+                        <div class="summary-grid talos-operator-grid">
+                            <article class="summary-card"><p class="summary-label">State</p><p class="summary-value">{{ close_preview_state }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Method</p><p class="summary-value">{{ talos_payload.real_execution.close_preview.preferred_method }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Contracts</p><p class="summary-value">{{ talos_payload.real_execution.close_preview.contracts }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Expiration</p><p class="summary-value">{{ talos_payload.real_execution.close_preview.expiration_date }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Strikes</p><p class="summary-value">{{ talos_payload.real_execution.close_preview.short_strike }} / {{ talos_payload.real_execution.close_preview.long_strike }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Net Debit</p><p class="summary-value">{{ talos_payload.real_execution.close_preview.limit_price_display }}</p></article>
+                            <article class="summary-card"><p class="summary-label">Trigger</p><p class="summary-value">{{ talos_payload.real_execution.close_preview.trigger_reason }}</p></article>
+                        </div>
+                        <div class="message message-info message-inline">{{ talos_payload.real_execution.close_preview.summary }}</div>
+                    </details>
+                {% endif %}
+            </details>
+        </section>
+
+        <section class="panel trade-dashboard-panel">
+            <details class="apollo-inline-details talos-advanced-details">
+                <summary class="apollo-inline-summary">Advanced Diagnostics</summary>
+                <div class="summary-grid talos-operator-grid">
+                    <article class="summary-card"><p class="summary-label">Candidate Cache</p><p class="summary-value">{{ talos_payload.candidate.cache_diagnostics.cache_state|default('n/a') }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Candidate Cache Expiry</p><p class="summary-value">{{ talos_payload.candidate.cache_diagnostics.cache_expires_at|default('—') }}</p></article>
+                    <article class="summary-card"><p class="summary-label">Apollo Events</p><p class="summary-value">{{ talos_payload.performance_report.event_count }}</p></article>
+                </div>
+                {% if talos_payload.performance_report.slowest_calls %}
+                    <div class="table-wrap trade-table-wrap talos-activity-log-wrap">
+                        <table>
+                            <thead>
+                                <tr><th>Metric</th><th>Count</th><th>Cache Hits</th><th>Cache Misses</th><th>Avg ms</th><th>Max ms</th></tr>
+                            </thead>
+                            <tbody>
+                                {% for item in talos_payload.performance_report.slowest_calls %}
+                                    <tr><td>{{ item.name }}</td><td>{{ item.count }}</td><td>{{ item.cache_hits }}</td><td>{{ item.cache_misses }}</td><td>{{ item.avg_ms }}</td><td>{{ item.max_ms }}</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                {% endif %}
+            </details>
+        </section>
+
+        <section class="panel trade-dashboard-panel">
+            <div class="result-header">
+                <div>
+                    <h2>Activity Log</h2>
+                </div>
+            </div>
+
+            {% if talos_payload.activity_log %}
+                <details class="apollo-inline-details talos-advanced-details">
+                    <summary class="apollo-inline-summary">View Full Activity Log ({{ talos_payload.activity_log|length }} entries)</summary>
+                    <div class="table-wrap trade-table-wrap talos-activity-log-wrap">
+                        <table>
+                            <thead>
+                                <tr><th>Time</th><th>Mode</th><th>Event</th><th>Result</th><th>Reason</th><th>Details</th></tr>
+                            </thead>
+                            <tbody>
+                                {% for item in talos_payload.activity_log[:3] %}
+                                    <tr><td>{{ item.timestamp }}</td><td>{{ item.mode }}</td><td>{{ item.event_type }}</td><td>{{ item.result }}</td><td>{{ item.reason }}</td><td>{{ item.details }}</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </details>
+            {% else %}
+                <div class="message message-info message-inline">Talos has not recorded any Talos 3.10 activity yet.</div>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>

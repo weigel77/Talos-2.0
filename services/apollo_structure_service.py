@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta
+from time import perf_counter
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ from config import AppConfig, get_app_config
 
 from .market_calendar_service import MarketCalendarService
 from .market_data import MarketDataError, MarketDataService
+from .runtime_metrics_service import get_runtime_metrics_service
 from .technical_indicators import calculate_wilder_rsi
 
 LOGGER = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ class ApolloStructureService:
 
     def analyze_same_day_spx_structure(self, *, caller_source: str = "apollo-structure") -> Dict[str, Any]:
         """Return current or fallback-session SPX structure metrics, chart data, and classification output."""
+        started = perf_counter()
         provider_name = self.market_data_service.get_provider_metadata().get("live_provider_name", "Unknown Provider")
         preferred_source = (self.config.apollo_structure_source or "spx").strip().lower()
         attempted_sources: List[Dict[str, str]] = []
@@ -115,7 +118,7 @@ class ApolloStructureService:
                 requested_status=requested_status,
             )
 
-            return {
+            result = {
                 "available": True,
                 "provider_name": provider_name,
                 "preferred_source": self.STRUCTURE_SOURCES.get(preferred_source, self.STRUCTURE_SOURCES["spx"])["label"],
@@ -143,12 +146,26 @@ class ApolloStructureService:
                 "rsi_note": rsi_context["note"],
                 "rsi_detail": rsi_context["detail"],
             }
+            get_runtime_metrics_service().record(
+                "Apollo structure refresh",
+                (perf_counter() - started) * 1000.0,
+                cache_hit=False,
+                detail=str(caller_source or "apollo-structure"),
+            )
+            return result
 
-        return self._build_unavailable_result(
+        result = self._build_unavailable_result(
             provider_name=provider_name,
             detail=last_error,
             attempted_sources=attempted_sources,
         )
+        get_runtime_metrics_service().record(
+            "Apollo structure refresh",
+            (perf_counter() - started) * 1000.0,
+            cache_hit=False,
+            detail=str(caller_source or "apollo-structure"),
+        )
+        return result
 
     def _get_latest_valid_intraday_session(
         self,

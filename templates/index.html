@@ -384,7 +384,7 @@
                                 {% endfor %}
                             </svg>
                         {% else %}
-                            <p class="subtle">Credit map unavailable for this chain snapshot.</p>
+                            <p class="subtle">Credit map unavailable: {{ apollo_result.option_chain_message if not apollo_result.option_chain_success else apollo_result.trade_candidates_message }}.</p>
                         {% endif %}
                     </section>
 
@@ -395,13 +395,7 @@
                                     <div class="apollo-candidate-header">
                                         <div class="apollo-candidate-mode">
                                             <span class="apollo-mode-icon apollo-mode-icon-{{ candidate.mode_key }}" aria-hidden="true">
-                                                {% if candidate.mode_key == 'standard' %}
-                                                    <svg viewBox="0 0 24 24" role="presentation"><path d="M12 3l7 3v5c0 4.8-2.9 8.9-7 10-4.1-1.1-7-5.2-7-10V6l7-3Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 12h8M12 8v8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-                                                {% elif candidate.mode_key == 'aggressive' %}
-                                                    <svg viewBox="0 0 24 24" role="presentation"><path d="M13 2L6 13h4l-1 9 9-13h-5l0-7Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>
-                                                {% else %}
-                                                    <svg viewBox="0 0 24 24" role="presentation"><path d="M4 21h16M6 21V9l6-4 6 4v12M9 21v-5h6v5M9 11h.01M15 11h.01" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>
-                                                {% endif %}
+                                                <svg viewBox="0 0 24 24" role="presentation"><path d="M4 21h16M6 21V9l6-4 6 4v12M9 21v-5h6v5M9 11h.01M15 11h.01" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>
                                             </span>
                                             <div>
                                                 <p class="apollo-candidate-rank">{{ candidate.mode_label }}</p>
@@ -516,25 +510,6 @@
                                         <div class="message message-warning message-inline">{{ candidate.no_trade_message }}</div>
                                     {% endif %}
 
-                                    {% if candidate.available %}
-                                        <div class="actions apollo-candidate-actions">
-                                            <form method="post" action="{% if hosted_mode %}{{ hosted_apollo_prefill_url }}{% else %}{{ url_for('apollo_prefill_candidate') }}{% endif %}" class="apollo-transfer-form" data-disable-submit-buttons>
-                                                <input type="hidden" name="target_mode" value="real">
-                                                {% for key, value in candidate.prefill_fields.items() %}
-                                                    <input type="hidden" name="{{ key }}" value="{{ value }}">
-                                                {% endfor %}
-                                                <button type="submit">Send to Real Trades</button>
-                                            </form>
-                                            <form method="post" action="{% if hosted_mode %}{{ hosted_apollo_prefill_url }}{% else %}{{ url_for('apollo_prefill_candidate') }}{% endif %}" class="apollo-transfer-form" data-disable-submit-buttons>
-                                                <input type="hidden" name="target_mode" value="simulated">
-                                                {% for key, value in candidate.prefill_fields.items() %}
-                                                    <input type="hidden" name="{{ key }}" value="{{ value }}">
-                                                {% endfor %}
-                                                <button type="submit" class="secondary">Send to Simulated Trades</button>
-                                            </form>
-                                        </div>
-                                    {% endif %}
-
                                     <div class="apollo-candidate-detail-grid">
                                         <details class="apollo-inline-details apollo-candidate-section apollo-candidate-dropdown">
                                             <summary class="apollo-inline-summary">Rationale</summary>
@@ -572,7 +547,7 @@
                             {% endfor %}
                         </div>
                     {% else %}
-                        <p class="subtle">No Gate 3 spread passed the current Apollo filters for this next-market-day SPX expiration.</p>
+                        <p class="subtle">{{ apollo_result.trade_candidates_message if apollo_result.trade_candidates_message else (apollo_result.option_chain_message if not apollo_result.option_chain_success else 'No Gate 3 spread passed the current Apollo filters for this next-market-day SPX expiration.') }}</p>
                     {% endif %}
 
                     {% if not hosted_mode %}
@@ -669,6 +644,7 @@
                             {% endif %}
                         </div>
                     </details>
+                    {% endif %}
 
                     <details class="apollo-collapsible apollo-compact-panel apollo-macro-details">
                         <summary class="apollo-collapsible-summary">
@@ -733,11 +709,10 @@
                                     </table>
                                 </div>
                             {% else %}
-                                <p class="subtle">No raw SPX option-chain preview rows were available.</p>
+                                <p class="subtle">No raw SPX option-chain preview rows were available. {{ apollo_result.option_chain_message }}</p>
                             {% endif %}
                         </div>
                     </details>
-                    {% endif %}
                 </section>
             </section>
         {% elif active_page == 'apollo' %}

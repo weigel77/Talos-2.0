@@ -72,7 +72,7 @@ class LocalFileSystemStorageComposer:
             or (persistent_data_dir / "kairos_replays")
         )
         app_log_path = Path(app.config.get("APP_LOG_PATH") or self.config.app_log_path or (Path(app.root_path) / "market_lookup.log")).expanduser()
-        schwab_token_path = Path(self.config.schwab_token_path)
+        schwab_token_path = Path(self.config.schwab_shared_market_token_path)
         legacy_candidates = [instance_path / "kairos_replays"]
         if not app.config.get("TESTING"):
             workspace_root = self.workspace_root_resolver()

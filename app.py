@@ -26,7 +26,9 @@ from config import (
     HOSTED_APP_DISPLAY_NAME,
     HOSTED_APP_VERSION,
     HOSTED_PRODUCTION_CALLBACK_URL,
+    HOSTED_PRODUCTION_TRADING_CALLBACK_URL,
     HOSTED_PRODUCTION_PUBLIC_BASE_URL,
+    LOCAL_SCHWAB_TRADING_REDIRECT_URI,
     get_app_config,
 )
 from services import (
@@ -40,6 +42,7 @@ from services import (
     PerformanceEngine,
     PushoverService,
 )
+from services.talos_engine import TalosEngine
 from services.performance_dashboard_service import PERFORMANCE_DEFAULT_FILTERS, PERFORMANCE_FILTER_GROUPS, build_dashboard_payload, normalize_filter_value
 from services.repositories.apollo_snapshot_repository import ApolloSnapshotRepository
 from services.repositories.hosted_runtime_state_repository import SupabaseHostedRuntimeStateRepository, SupabaseImportPreviewRepository
@@ -55,6 +58,7 @@ from services.repositories.trade_notification_repository import (
     TradeNotificationRepository,
 )
 from services.repositories.trade_repository import TradeRepository
+from services.repositories.token_repository import JsonFileTokenRepository
 from services.runtime.auth_composition import HostedSupabaseAuthComposer, LocalAuthComposer
 from services.runtime.host_infrastructure import select_host_infrastructure_assembler
 from services.runtime.hosted_auth import HostedAuthConfig, HostedSessionAuthenticator, NoopHostedSessionAuthenticator, SupabaseEmailPasswordAuthenticator
@@ -69,6 +73,9 @@ from services.runtime.profile import RuntimeProfile, select_runtime_profile
 from services.runtime.scheduler import ThreadingTimerScheduler
 from services.runtime.service_composition import RuntimeServiceComposer
 from services.runtime.workflow_state import FlaskSessionWorkflowState, WorkflowStateStore
+from services.schwab_trading_auth_service import SchwabTradingAuthService
+from services.talos_execution_service import TalosExecutionService
+from services.runtime_metrics_service import get_runtime_metrics_service
 from services.trade_importer import parse_trade_import
 from services.trade_store import (
     DEFAULT_CANDIDATE_PROFILE,
@@ -81,6 +88,7 @@ from services.trade_store import (
     form_trade_record,
     normalize_candidate_profile,
     normalize_expected_move_source,
+    normalize_journal_name,
     resolve_trade_credit_model,
     resolve_trade_candidate_profile,
     resolve_trade_distance,
@@ -117,6 +125,52 @@ HOSTED_MOBILE_KAIROS_HANDOFF_KEY = "hosted_mobile_kairos_handoff"
 HOSTED_PERFORMANCE_CACHE_SECONDS = 10
 HOSTED_OPEN_TRADES_CACHE_SECONDS = 10
 HOSTED_APOLLO_SNAPSHOT_CACHE_SECONDS = 20
+
+
+def migrate_legacy_schwab_market_token(target_token_path: Path, *, workspace_root: Path) -> Path | None:
+    """Promote any legacy Talos-3.0 local token file into the authoritative market-data token path."""
+    resolved_target = target_token_path.expanduser()
+    if resolved_target.exists():
+        return None
+
+    legacy_candidates = (
+        workspace_root / "schwab_token.json",
+        workspace_root / "instance" / "schwab_token.dev.json",
+    )
+    for legacy_path in legacy_candidates:
+        resolved_legacy = legacy_path.expanduser()
+        if not resolved_legacy.exists() or resolved_legacy == resolved_target:
+            continue
+        resolved_target.parent.mkdir(parents=True, exist_ok=True)
+        resolved_legacy.replace(resolved_target)
+        return resolved_target
+    return None
+
+
+def validate_persisted_schwab_token(auth_service: Any) -> Dict[str, Any]:
+    """Confirm that Schwab OAuth produced a usable persisted token payload."""
+    token_store = getattr(auth_service, "token_store", None)
+    if token_store is None or not hasattr(token_store, "load"):
+        raise RuntimeError("Schwab token store is unavailable after OAuth callback.")
+
+    token_payload = token_store.load() or {}
+    access_token = str(token_payload.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("Schwab token exchange did not leave a usable access token in the configured token store.")
+
+    file_path = getattr(token_store, "file_path", None)
+    if isinstance(file_path, Path) and str(file_path).strip() and not str(file_path).startswith("supabase://"):
+        if not file_path.exists():
+            raise RuntimeError(f"Schwab token exchange completed, but the configured token file was not created: {file_path}")
+
+    return token_payload
+
+
+def resolve_post_oauth_redirect_target(runtime_config: AppConfig) -> str:
+    """Return the post-OAuth landing page for the active runtime."""
+    if runtime_config.runtime_target == "hosted":
+        return url_for("hosted_shell_home")
+    return url_for("index")
 HOSTED_APOLLO_AUTORUN_CACHE_SECONDS = 20
 HOSTED_KAIROS_CACHE_SECONDS = 10
 HOSTED_HEADER_SNAPSHOT_CACHE_SECONDS = 20
@@ -178,11 +232,11 @@ QUERY_DEFINITIONS = [
     QueryDefinition("vix_close_range", "VIX closing values for a date range", "range", "^VIX", "VIX", "range"),
 ]
 QUERY_LOOKUP = {definition.key: definition for definition in QUERY_DEFINITIONS}
-TRADE_MODE_LABELS = {"real": "Journal", "simulated": "Simulated Trades", "talos": "Journal"}
+TRADE_MODE_LABELS = {"real": "Shared Journal", "simulated": "Simulated Trades", "talos": "Talos Journal"}
 TRADE_MODE_DESCRIPTIONS = {
-    "real": "Apollo and Talos trade history for the retained Talos 2 journal.",
-    "simulated": "Persistent Apollo paper-trade log for simulated execution review.",
-    "talos": "Apollo and Talos trade history for the retained Talos 2 journal.",
+    "real": "Shared Supabase Journal history for retained Apollo and Talos trades.",
+    "simulated": "Shared Supabase Journal history for simulated execution review.",
+    "talos": "Talos rows from the Shared Supabase Journal filtered by system = Talos.",
 }
 PUBLIC_TRADE_MODES = ("real", "simulated")
 LOCAL_SCHWAB_REDIRECT_URI = "https://127.0.0.1:5015/callback"
@@ -251,6 +305,10 @@ TRADE_FILTER_GROUPS = {
     "profile": ["Legacy", "Aggressive", "Fortress", "Standard", "Prime", "Subprime"],
     "result": ["Win", "Loss", "Black Swan"],
 }
+HOSTED_TALOS_TRADE_FILTER_GROUPS = {
+    **TRADE_FILTER_GROUPS,
+    "system": ["Talos"],
+}
 
 
 def build_oauth_session_keys(namespace: str) -> Dict[str, str]:
@@ -264,6 +322,16 @@ def build_oauth_session_keys(namespace: str) -> Dict[str, str]:
         "authorized": f"{prefix}_authorized",
         "callback_pending": f"{prefix}_callback_pending",
     }
+
+
+def redact_execution_authorize_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(str(url or ""))
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    redacted_query = [
+        (key, "REDACTED" if key.lower() == "client_id" else value)
+        for key, value in query
+    ]
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(redacted_query, doseq=True)))
 
 
 def mask_oauth_state(value: Any) -> str:
@@ -317,6 +385,7 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
         "SCHWAB_TOKEN_URL": "schwab_token_url",
         "SCHWAB_BASE_URL": "schwab_base_url",
         "SCHWAB_TOKEN_PATH": "schwab_token_path",
+        "SCHWAB_SHARED_MARKET_TOKEN_PATH": "schwab_shared_market_token_path",
         "SCHWAB_ES_PRIMARY_SYMBOL": "schwab_es_primary_symbol",
         "SCHWAB_ES_FALLBACK_SYMBOL": "schwab_es_fallback_symbol",
         "SCHWAB_SPX_OPTION_CHAIN_SYMBOL": "schwab_spx_option_chain_symbol",
@@ -325,6 +394,14 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
         "SCHWAB_HISTORY_FREQUENCY_TYPE": "schwab_history_frequency_type",
         "SCHWAB_HISTORY_FREQUENCY": "schwab_history_frequency",
         "SCHWAB_HISTORY_NEED_EXTENDED_HOURS": "schwab_history_need_extended_hours",
+        "SCHWAB_TRADING_CLIENT_ID": "schwab_trading_client_id",
+        "SCHWAB_TRADING_CLIENT_SECRET": "schwab_trading_client_secret",
+        "SCHWAB_TRADING_REDIRECT_URI": "schwab_trading_redirect_uri",
+        "SCHWAB_TRADING_AUTH_URL": "schwab_trading_auth_url",
+        "SCHWAB_TRADING_TOKEN_URL": "schwab_trading_token_url",
+        "SCHWAB_TRADING_BASE_URL": "schwab_trading_base_url",
+        "SCHWAB_TRADING_TOKEN_PATH": "schwab_trading_token_path",
+        "SCHWAB_TRADING_OAUTH_SESSION_NAMESPACE": "schwab_trading_oauth_session_namespace",
         "PUSHOVER_USER_KEY": "pushover_user_key",
         "PUSHOVER_API_TOKEN": "pushover_api_token",
     }
@@ -335,6 +412,8 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
     runtime_target = str(config_payload.get("runtime_target") or "local").strip().lower() or "local"
     hosted_public_base_url = str(config_payload.get("hosted_public_base_url") or "").strip()
     configured_redirect_uri = str(config_payload.get("schwab_redirect_uri") or "").strip()
+    configured_trading_redirect_uri = str(config_payload.get("schwab_trading_redirect_uri") or "").strip()
+    local_hosted_debug_base = any(host in hosted_public_base_url.lower() for host in LOCAL_DEV_HOSTS)
     strict_hosted_production = (
         runtime_target == "hosted"
         and not app.testing
@@ -365,13 +444,29 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
 
         config_payload["hosted_public_base_url"] = normalized_hosted_public_base_url
         config_payload["schwab_redirect_uri"] = resolved_redirect_uri
-        config_payload["schwab_token_path"] = "supabase://hosted_runtime_state/schwab_oauth_token/default"
+        if strict_hosted_production:
+            config_payload["schwab_trading_redirect_uri"] = HOSTED_PRODUCTION_TRADING_CALLBACK_URL
+        elif normalized_hosted_public_base_url:
+            config_payload["schwab_trading_redirect_uri"] = f"{normalized_hosted_public_base_url}/auth/schwab-trading/callback"
+        elif configured_trading_redirect_uri:
+            config_payload["schwab_trading_redirect_uri"] = configured_trading_redirect_uri
+        else:
+            config_payload["schwab_trading_redirect_uri"] = LOCAL_SCHWAB_TRADING_REDIRECT_URI
+        if strict_hosted_production or not local_hosted_debug_base:
+            config_payload["schwab_token_path"] = "supabase://hosted_runtime_state/schwab_oauth_token/default"
+            config_payload["schwab_shared_market_token_path"] = "supabase://hosted_runtime_state/schwab_oauth_token/default"
         if strict_hosted_production and resolved_redirect_uri != HOSTED_PRODUCTION_CALLBACK_URL:
             raise RuntimeError("Hosted production requires SCHWAB redirect_uri=https://eigeltrade.com/callback.")
     elif configured_redirect_uri:
         config_payload["schwab_redirect_uri"] = configured_redirect_uri
     else:
         config_payload["schwab_redirect_uri"] = LOCAL_SCHWAB_REDIRECT_URI
+
+    if runtime_target != "hosted":
+        if configured_trading_redirect_uri:
+            config_payload["schwab_trading_redirect_uri"] = configured_trading_redirect_uri
+        else:
+            config_payload["schwab_trading_redirect_uri"] = LOCAL_SCHWAB_TRADING_REDIRECT_URI
 
     return AppConfig(**config_payload)
 
@@ -406,7 +501,13 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     runtime_app_config = resolve_runtime_app_config(app, APP_CONFIG)
     host_infrastructure_assembler = select_host_infrastructure_assembler(app, runtime_app_config)
     host_infrastructure = host_infrastructure_assembler.assemble(app)
+    migrated_token_path = migrate_legacy_schwab_market_token(
+        host_infrastructure.storage.schwab_token_path,
+        workspace_root=Path(app.root_path),
+    )
     configure_logging(app, host_infrastructure)
+    if migrated_token_path is not None:
+        app.logger.info("Migrated Schwab market token to authoritative Talos path | token_target_path=%s", migrated_token_path)
     runtime_app_config = resolve_runtime_app_config(app, APP_CONFIG)
     runtime_profile = select_runtime_profile(app, runtime_app_config)
     launch_behavior = WebBrowserLaunchBehavior()
@@ -416,16 +517,23 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         scheduler=ThreadingTimerScheduler(),
         shutdown_registrar=__import__("atexit").register,
     )
+    local_hosted_debug_runtime = (
+        runtime_app_config.runtime_target == "hosted"
+        and any(host in str(runtime_app_config.hosted_public_base_url or "").lower() for host in LOCAL_DEV_HOSTS)
+    )
     if app.config.get("RUNTIME_TARGET") == "hosted":
         supabase_context = host_infrastructure.supabase_context
         supabase_integration = host_infrastructure.supabase_integration
         if supabase_context is None or supabase_integration is None or not supabase_context.configured:
             raise RuntimeError(f"{HOSTED_APP_DISPLAY_NAME} cannot start without configured Supabase infrastructure.")
-        auth_composer = HostedSupabaseAuthComposer(
-            runtime_app_config,
-            context=supabase_context,
-            gateway=supabase_integration.create_table_gateway(),
-        )
+        if local_hosted_debug_runtime:
+            auth_composer = LocalAuthComposer(runtime_app_config, token_path=host_infrastructure.storage.schwab_token_path)
+        else:
+            auth_composer = HostedSupabaseAuthComposer(
+                runtime_app_config,
+                context=supabase_context,
+                gateway=supabase_integration.create_table_gateway(),
+            )
     else:
         auth_composer = LocalAuthComposer(runtime_app_config, token_path=host_infrastructure.storage.schwab_token_path)
     provider_composer = LocalProviderComposer(runtime_app_config, auth_composer)
@@ -467,6 +575,22 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     performance_service = service_bundle.performance_service
     performance_engine = service_bundle.performance_engine
     open_trade_manager = service_bundle.open_trade_manager
+    execution_auth_service = SchwabTradingAuthService(
+        config=runtime_app_config,
+        token_store=JsonFileTokenRepository(runtime_app_config.schwab_trading_token_path),
+    )
+    talos_engine = TalosEngine(
+        trade_store=trade_store,
+        apollo_service=apollo_service,
+        open_trade_manager=open_trade_manager,
+        execution_auth_service=execution_auth_service,
+        order_service=TalosExecutionService(execution_auth_service=execution_auth_service, config=runtime_app_config),
+        apollo_snapshot_repository=apollo_snapshot_repository,
+        config=runtime_app_config,
+        scheduler=service_bundle.runtime_scheduler,
+        state_path=Path(app.instance_path) / "talos_state.json",
+    )
+    talos_engine.initialize()
     trade_notification_repository = build_trade_notification_repository(app, trade_store)
     trade_notification_repository.initialize()
     global_notification_settings_repository = build_global_notification_settings_repository(app, trade_store)
@@ -503,6 +627,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     app.extensions["performance_service"] = performance_service
     app.extensions["performance_engine"] = performance_engine
     app.extensions["open_trade_manager"] = open_trade_manager
+    app.extensions["talos_engine"] = talos_engine
+    app.extensions["schwab_trading_auth_service"] = talos_engine.execution_auth_service
     app.extensions["strategy_snapshots"] = getattr(
         service_bundle,
         "strategy_snapshots",
@@ -511,7 +637,15 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     app.extensions["trade_notification_repository"] = trade_notification_repository
     app.extensions["pushover_service"] = pushover_service
     app.extensions["oauth_session_keys"] = build_oauth_session_keys(app.config["OAUTH_SESSION_NAMESPACE"])
-    runtime_components = service_bundle.runtime_components
+    app.extensions["trading_oauth_session_keys"] = build_oauth_session_keys(runtime_app_config.schwab_trading_oauth_session_namespace)
+    runtime_components = [
+        *service_bundle.runtime_components,
+        RuntimeComponent(
+            name="talos_engine",
+            startup=talos_engine.start_background_monitoring,
+            shutdown=talos_engine.shutdown,
+        ),
+    ]
     for component in runtime_components:
         lifecycle_coordinator.register_component(component)
     app.extensions["runtime_components"] = runtime_components
@@ -527,6 +661,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         path = request.path.rstrip("/") or "/"
         if path == "/kairos" or path.startswith("/kairos/"):
             abort(404)
+        if path == "/hosted/mobile" or path.startswith("/hosted/mobile/"):
+            return redirect(url_for("hosted_shell_home"))
         if path == "/hosted/kairos" or path.startswith("/hosted/kairos/"):
             abort(404)
         if path == "/hosted/mobile/kairos" or path.startswith("/hosted/mobile/kairos/"):
@@ -586,6 +722,353 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             **template_context,
         )
 
+    def render_talos_page(
+        *,
+        hosted_mode: bool,
+        identity: Optional[RequestIdentity] = None,
+        force_refresh: bool = False,
+        error_message: Optional[str] = None,
+    ) -> Any:
+        started = time.perf_counter()
+        workflow_state = get_workflow_state(app)
+        talos_payload = get_talos_engine(app).get_dashboard_payload(
+            force_refresh=force_refresh,
+            caller_source=("hosted-talos-page" if hosted_mode else "talos-page"),
+        )
+        talos_payload = dict(talos_payload or {})
+        talos_payload.setdefault(
+            "gate_test",
+            {
+                "current": "live",
+                "label": "Live market",
+                "options": [
+                    {"value": "live", "label": "Live market"},
+                    {"value": "within15", "label": "Within 15 points"},
+                    {"value": "within5", "label": "Within 5 points"},
+                    {"value": "below2", "label": "2 full 5-minute candles below short strike"},
+                    {"value": "below30", "label": "More than 30 minutes below short strike"},
+                ],
+            },
+        )
+        market_data_status = resolve_schwab_connection_status(get_market_data_service(app))
+        execution_auth_service = get_schwab_trading_auth_service(app)
+        execution_status = execution_auth_service.get_connection_status()
+        execution_debug = execution_auth_service.get_debug_status()
+        execution_debug.update(
+            {
+                "account_fetch_status": str(workflow_state.get("schwab_trading_last_account_fetch_status", "Not attempted in this session") or "Not attempted in this session"),
+                "account_fallback_reason": str(
+                    talos_payload.get("account", {}).get("execution_status_meta")
+                    if talos_payload.get("account", {}).get("manual_override_enabled")
+                    else "—"
+                ),
+                "callback_last_result": str(workflow_state.get("schwab_trading_last_callback_result", "No execution callback recorded in this session") or "No execution callback recorded in this session"),
+            }
+        )
+        template_context: Dict[str, Any] = {
+            "talos_payload": talos_payload,
+            "error_message": error_message,
+            "info_message": pop_status_message(),
+            "talos_update_url": (url_for("hosted_talos_update_settings") if hosted_mode else url_for("talos_update_settings")),
+            "talos_simulated_open_check_url": (
+                url_for("hosted_talos_simulated_open_check") if hosted_mode else url_for("talos_simulated_open_check")
+            ),
+            "talos_simulated_close_check_url": (
+                url_for("hosted_talos_simulated_close_check") if hosted_mode else url_for("talos_simulated_close_check")
+            ),
+            "talos_real_open_check_url": (
+                url_for("hosted_talos_real_open_check") if hosted_mode else url_for("talos_real_open_check")
+            ),
+            "talos_real_close_check_url": (
+                url_for("hosted_talos_real_close_check") if hosted_mode else url_for("talos_real_close_check")
+            ),
+            "talos_manual_execution_url": (url_for("hosted_talos_manual_execution") if hosted_mode else url_for("talos_manual_execution")),
+            "talos_trade_log_url": (
+                url_for("hosted_shell_journal", trade_mode="talos")
+                if hosted_mode
+                else url_for("trade_dashboard", trade_mode="talos")
+            ),
+            "execution_auth_login_url": url_for("schwab_trading_login"),
+            "execution_auth_logout_url": url_for("schwab_trading_logout"),
+            "execution_auth_status_url": url_for("schwab_trading_status"),
+            "market_data_status": market_data_status,
+            "execution_auth_status": execution_status,
+            "execution_auth_debug": execution_debug,
+            "active_page": "talos",
+        }
+        if hosted_mode and identity is not None:
+            template_context.update(
+                build_hosted_template_context(
+                    identity,
+                    app=app,
+                    extra_status_items=[
+                        {
+                            "label": "Execution Schwab",
+                            "value": str(execution_status.get("status_label") or "Disconnected"),
+                            "meta": str(execution_status.get("status_meta") or "Separate token store"),
+                            "tone": "good" if execution_status.get("connected") else "warning",
+                        }
+                    ],
+                )
+            )
+        get_runtime_metrics_service().record(
+            "/hosted/talos" if hosted_mode else "/talos",
+            (time.perf_counter() - started) * 1000.0,
+            detail=("force-refresh" if force_refresh else "warm-cache"),
+        )
+        return render_template("talos.html", **template_context)
+
+    def reconcile_talos_runtime_state(*, caller_source: str) -> None:
+        try:
+            get_talos_engine(app).reconcile_expired_talos_trades(caller_source=caller_source)
+        except Exception as exc:
+            app.logger.warning("Talos expiration reconciliation skipped | caller=%s | error=%s", caller_source, exc)
+
+    @app.get("/talos")
+    def talos_workspace() -> Any:
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_shell_talos"))
+        force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes", "on"}
+        return render_talos_page(hosted_mode=False, force_refresh=force_refresh)
+
+    @app.post("/talos/actions/update")
+    def talos_update_settings() -> Any:
+        result = get_talos_engine(app).update_settings(request.form)
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("talos_workspace"))
+
+    @app.post("/talos/actions/manual-execution")
+    def talos_manual_execution() -> Any:
+        result = get_talos_engine(app).queue_manual_execution_test(request.form)
+        set_status_message(result["message"], level=result.get("level", "info"))
+        if result.get("ok") and result.get("prefill") and result.get("redirect_mode"):
+            redirect_mode = str(result["redirect_mode"])
+            store_trade_prefill(redirect_mode, result["prefill"])
+            return redirect(url_for("trade_dashboard", trade_mode=redirect_mode, prefill=1, _anchor="trade-entry-form"))
+        return redirect(url_for("talos_workspace"))
+
+    @app.post("/talos/actions/simulated-open-check")
+    def talos_simulated_open_check() -> Any:
+        result = get_talos_engine(app).run_simulated_open_check(trigger_reason="manual-button")
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("talos_workspace"))
+
+    @app.post("/talos/actions/simulated-close-check")
+    def talos_simulated_close_check() -> Any:
+        result = get_talos_engine(app).run_simulated_close_check(trigger_reason="manual-button")
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("talos_workspace"))
+
+    @app.post("/talos/actions/real-open-check")
+    def talos_real_open_check() -> Any:
+        result = get_talos_engine(app).run_real_open_check(
+            trigger_reason="manual-button",
+            confirmation_text=str(request.form.get("real_order_confirmation_text") or ""),
+        )
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("talos_workspace"))
+
+    @app.post("/talos/actions/real-close-check")
+    def talos_real_close_check() -> Any:
+        result = get_talos_engine(app).run_real_close_check(
+            trigger_reason="manual-button",
+            confirmation_text=str(request.form.get("real_order_confirmation_text") or ""),
+            manual_override=str(request.form.get("manual_close_override") or "").strip().lower() in {"1", "true", "yes", "on"},
+        )
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("talos_workspace"))
+
+    @app.get("/auth/schwab-trading/login")
+    def schwab_trading_login() -> Any:
+        workflow_state = get_workflow_state(app)
+        session_keys = app.extensions["trading_oauth_session_keys"]
+        auth_service = get_schwab_trading_auth_service(app)
+        state = auth_service.build_state_token()
+        workflow_state.put(session_keys["oauth_state"], state)
+        workflow_state.put(session_keys["login_in_progress"], True)
+        workflow_state.put(session_keys["callback_pending"], True)
+        workflow_state.put("schwab_trading_authenticated", False)
+        workflow_state.put("schwab_trading_account", "")
+        workflow_state.put("schwab_trading_token_expiration", "")
+        workflow_state.put("schwab_trading_last_callback_result", "Execution login launched; callback pending.")
+        workflow_state.put("schwab_trading_last_account_fetch_status", "Not attempted yet")
+        try:
+            authorize_url = auth_service.build_authorization_url(state=state)
+            trading_client_id = str(auth_service.config.schwab_trading_client_id or "").strip()
+            market_client_id = str(auth_service.config.schwab_client_id or "").strip()
+            app.logger.info(
+                "Execution OAuth login reached | path=%s | client_id_present=%s | client_id=%s | client_matches_market=%s | client_secret_present=%s | redirect_uri=%s | authorize_url=%s",
+                request.path,
+                "yes" if bool(trading_client_id) else "no",
+                trading_client_id or "",
+                "yes" if trading_client_id and trading_client_id == market_client_id else "no",
+                "yes" if bool(str(auth_service.config.schwab_trading_client_secret or "").strip()) else "no",
+                auth_service.config.schwab_trading_redirect_uri,
+                authorize_url,
+            )
+            return redirect(authorize_url)
+        except Exception as exc:
+            trading_client_id = str(auth_service.config.schwab_trading_client_id or "").strip()
+            market_client_id = str(auth_service.config.schwab_client_id or "").strip()
+            app.logger.warning(
+                "Execution OAuth login failed before redirect | path=%s | client_id_present=%s | client_id=%s | client_matches_market=%s | client_secret_present=%s | redirect_uri=%s | error=%s",
+                request.path,
+                "yes" if bool(trading_client_id) else "no",
+                trading_client_id or "",
+                "yes" if trading_client_id and trading_client_id == market_client_id else "no",
+                "yes" if bool(str(auth_service.config.schwab_trading_client_secret or "").strip()) else "no",
+                auth_service.config.schwab_trading_redirect_uri,
+                exc,
+            )
+            workflow_state.put(session_keys["login_in_progress"], False)
+            workflow_state.put(session_keys["callback_pending"], False)
+            set_status_message(str(exc), level="error")
+            return redirect(resolve_post_trading_oauth_redirect_target(app))
+
+    @app.get("/auth/schwab-trading/callback")
+    def schwab_trading_callback() -> Any:
+        workflow_state = get_workflow_state(app)
+        session_keys = app.extensions["trading_oauth_session_keys"]
+        auth_service = get_schwab_trading_auth_service(app)
+        received_state = request.args.get("state")
+        authorization_code = request.args.get("code")
+        redirect_target = resolve_post_trading_oauth_redirect_target(app)
+        token_file_path = getattr(auth_service.token_store, "file_path", None)
+        app.logger.info(
+            "Execution OAuth callback reached | path=%s | token_target_path=%s | token_file_created=%s",
+            request.path,
+            token_file_path or auth_service.config.schwab_trading_token_path,
+            bool(token_file_path and Path(token_file_path).exists()),
+        )
+
+        error = request.args.get("error")
+        if error:
+            workflow_state.put(session_keys["login_in_progress"], False)
+            workflow_state.put(session_keys["callback_pending"], False)
+            workflow_state.put("schwab_trading_authenticated", False)
+            workflow_state.put("schwab_trading_last_callback_result", f"Execution callback returned Schwab error: {error}")
+            workflow_state.put("schwab_trading_last_account_fetch_status", "Not attempted")
+            set_status_message(f"Schwab trading authorization failed: {error}", level="error")
+            return redirect(redirect_target)
+
+        expected_state = workflow_state.pop(session_keys["oauth_state"], None)
+        if not expected_state or received_state != expected_state:
+            workflow_state.put(session_keys["login_in_progress"], False)
+            workflow_state.put(session_keys["callback_pending"], False)
+            workflow_state.put("schwab_trading_authenticated", False)
+            workflow_state.put("schwab_trading_last_callback_result", "Execution callback state mismatch.")
+            workflow_state.put("schwab_trading_last_account_fetch_status", "Not attempted")
+            set_status_message("Schwab trading authorization state did not match. Please try again.", level="error")
+            return redirect(redirect_target)
+
+        if not authorization_code:
+            workflow_state.put(session_keys["login_in_progress"], False)
+            workflow_state.put(session_keys["callback_pending"], False)
+            workflow_state.put("schwab_trading_authenticated", False)
+            workflow_state.put("schwab_trading_last_callback_result", "Execution callback returned no authorization code.")
+            workflow_state.put("schwab_trading_last_account_fetch_status", "Not attempted")
+            set_status_message("Schwab trading did not return an authorization code.", level="error")
+            return redirect(redirect_target)
+
+        try:
+            token_payload = auth_service.exchange_code_for_tokens(authorization_code)
+            persisted_token_payload = validate_persisted_schwab_token(auth_service)
+            app.logger.info(
+                "Execution OAuth token exchange completed | token_target_path=%s | token_file_created=%s",
+                token_file_path or auth_service.config.schwab_trading_token_path,
+                bool(token_file_path and Path(token_file_path).exists()),
+            )
+            workflow_state.put(session_keys["login_in_progress"], False)
+            workflow_state.put(session_keys["callback_pending"], False)
+            workflow_state.put("schwab_trading_authenticated", True)
+            workflow_state.put("schwab_trading_token_expiration", str(persisted_token_payload.get("expires_at") or token_payload.get("expires_at") or ""))
+            workflow_state.put(
+                "schwab_trading_last_callback_result",
+                "Execution token exchange succeeded and persisted to the execution token store.",
+            )
+            try:
+                account_summary = auth_service.get_account_summary()
+                workflow_state.put("schwab_trading_account", str(account_summary.get("account_number_masked") or ""))
+                workflow_state.put("schwab_trading_last_account_fetch_status", "Account summary retrieved successfully")
+                set_status_message("Connected Schwab trading execution successfully.", level="info")
+            except Exception as exc:
+                app.logger.warning("Execution OAuth account summary unavailable after token exchange | error=%s", exc)
+                workflow_state.put("schwab_trading_account", "")
+                workflow_state.put(
+                    "schwab_trading_last_account_fetch_status",
+                    f"Account summary unavailable: {exc}",
+                )
+                set_status_message(
+                    f"Connected Schwab trading execution. Account summary unavailable: {exc}",
+                    level="warning",
+                )
+        except Exception as exc:
+            app.logger.warning(
+                "Execution OAuth callback failed | token_target_path=%s | token_file_created=%s | error=%s",
+                token_file_path or auth_service.config.schwab_trading_token_path,
+                bool(token_file_path and Path(token_file_path).exists()),
+                exc,
+            )
+            workflow_state.put(session_keys["login_in_progress"], False)
+            workflow_state.put(session_keys["callback_pending"], False)
+            workflow_state.put("schwab_trading_authenticated", False)
+            workflow_state.put("schwab_trading_account", "")
+            workflow_state.put("schwab_trading_token_expiration", "")
+            workflow_state.put("schwab_trading_last_callback_result", f"Execution callback failed: {exc}")
+            workflow_state.put("schwab_trading_last_account_fetch_status", "Not attempted")
+            set_status_message(str(exc), level="error")
+        return redirect(redirect_target)
+
+    @app.get("/auth/execution/status")
+    @app.get("/auth/schwab-trading/status")
+    def schwab_trading_status() -> Any:
+        auth_service = get_schwab_trading_auth_service(app)
+        status = auth_service.get_connection_status()
+        return jsonify(
+            {
+                "ok": True,
+                "connected": bool(status.get("connected")),
+                "requires_login": bool(status.get("requires_login")),
+                "requires_refresh": bool(status.get("requires_refresh")),
+                "status_label": status.get("status_label"),
+                "status_meta": status.get("status_meta"),
+                "token_expiration": status.get("token_expiration"),
+                "token_expiration_display": status.get("token_expiration_display"),
+                "token_path": str(get_runtime_app_config(app).schwab_trading_token_path),
+            }
+        )
+
+    @app.post("/auth/execution/logout")
+    @app.post("/auth/schwab-trading/logout")
+    def schwab_trading_logout() -> Any:
+        workflow_state = get_workflow_state(app)
+        session_keys = app.extensions["trading_oauth_session_keys"]
+        get_schwab_trading_auth_service(app).logout()
+        workflow_state.pop(session_keys["oauth_state"], None)
+        workflow_state.put(session_keys["login_in_progress"], False)
+        workflow_state.put(session_keys["callback_pending"], False)
+        workflow_state.put("schwab_trading_authenticated", False)
+        workflow_state.put("schwab_trading_account", "")
+        workflow_state.put("schwab_trading_token_expiration", "")
+        set_status_message("Disconnected Schwab trading execution auth.", level="info")
+        return redirect(resolve_post_trading_oauth_redirect_target(app))
+
+    @app.get("/auth/execution/login", endpoint="execution_auth_login")
+    def execution_auth_login_alias() -> Any:
+        return redirect(url_for("schwab_trading_login"))
+
+    @app.get("/auth/execution/callback", endpoint="execution_auth_callback")
+    def execution_auth_callback_alias() -> Any:
+        return redirect(url_for("schwab_trading_callback", **request.args.to_dict(flat=True)))
+
+    @app.get("/auth/execution/status", endpoint="execution_auth_status")
+    def execution_auth_status_alias() -> Any:
+        return redirect(url_for("schwab_trading_status"))
+
+    @app.post("/auth/execution/logout", endpoint="execution_auth_logout")
+    def execution_auth_logout_alias() -> Any:
+        return redirect(url_for("schwab_trading_logout"), code=307)
+
     @app.route("/hosted/private-access-check", methods=["GET"])
     def hosted_private_access_check() -> Any:
         if app.config.get("RUNTIME_TARGET") != "hosted":
@@ -622,15 +1105,15 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         if app.config.get("RUNTIME_TARGET") != "hosted":
             abort(404)
         next_path = sanitize_hosted_next_path(request.values.get("next"))
-        return redirect(build_hosted_launch_url(next_path=next_path, view=request.values.get("view")))
+        return redirect(url_for("hosted_branch_login", branch="desktop", next=next_path))
 
     @app.route("/hosted/login/<branch>", methods=["GET", "POST"])
     def hosted_branch_login(branch: str) -> Any:
         if app.config.get("RUNTIME_TARGET") != "hosted":
             abort(404)
-        active_branch = resolve_hosted_device_branch(branch)
-        if active_branch != str(branch or "").strip().lower():
-            return redirect(url_for("hosted_branch_login", branch=active_branch, next=sanitize_hosted_next_path(request.values.get("next"))))
+        active_branch = "desktop"
+        if str(branch or "").strip().lower() != "desktop":
+            return redirect(url_for("hosted_branch_login", branch="desktop", next=sanitize_hosted_next_path(request.values.get("next"))))
 
         next_path = sanitize_hosted_next_path(request.values.get("next"))
         remember_hosted_device_branch(active_branch)
@@ -700,60 +1183,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     def hosted_device_launch() -> Any:
         if app.config.get("RUNTIME_TARGET") != "hosted":
             abort(404)
-        app_identity = build_runtime_app_identity(app)
-        next_path = sanitize_hosted_next_path(request.args.get("next"))
-        explicit_view = normalize_hosted_device_branch(request.args.get("view"))
-        if explicit_view:
-            remember_hosted_device_branch(explicit_view)
-        preferred_view = explicit_view or get_hosted_device_branch(default="")
-
-        authenticated = False
-        identity: Optional[RequestIdentity] = None
-        try:
-            identity = require_hosted_private_access(app)
-            authenticated = True
-        except AuthenticationRequiredError:
-            identity = None
-        except PrivateAccessDeniedError as exc:
-            browser_response = current_app.make_response(
-                (
-                    render_template(
-                        "hosted_shell_access_error.html",
-                        page_browser_title="Hosted Access Restricted",
-                        page_heading="Hosted Access Restricted",
-                        page_copy=f"This hosted {HOSTED_APP_DISPLAY_NAME} shell is currently limited to the approved private-access allowlist.",
-                        error_code="private_access_denied",
-                        error_detail=str(exc),
-                    ),
-                    403,
-                )
-            )
-            get_session_invalidator(app).invalidate_response(browser_response)
-            return browser_response
-
-        desktop_target = (
-            build_hosted_branch_destination("desktop", next_path=next_path)
-            if authenticated
-            else build_hosted_login_url("desktop", next_path=next_path)
-        )
-        mobile_target = (
-            build_hosted_branch_destination("mobile", next_path=next_path)
-            if authenticated
-            else build_hosted_login_url("mobile", next_path=next_path)
-        )
-        return render_template(
-            "hosted_device_launch.html",
-            page_browser_title=f"{app_identity['display_name']} Portal",
-            desktop_target=desktop_target,
-            mobile_target=mobile_target,
-            explicit_view=explicit_view,
-            preferred_view=preferred_view,
-            authenticated=authenticated,
-            mobile_breakpoint=HOSTED_MOBILE_PHONE_MAX_WIDTH + 1,
-            desktop_home_url=build_hosted_branch_destination("desktop", next_path=next_path),
-            mobile_home_url=build_hosted_branch_destination("mobile", next_path=next_path),
-            **(build_hosted_template_context(identity, app=app) if identity is not None else {}),
-        )
+        current_app.logger.info("Hosted launch bypassed | redirect_target=%s", url_for("hosted_shell_home"))
+        return redirect(url_for("hosted_shell_home"))
 
     def render_hosted_mobile_shell(active_tab: str) -> Any:
         identity, error_response = authorize_hosted_private_browser_request(app)
@@ -844,51 +1275,14 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     def hosted_mobile_runs() -> Any:
         return redirect(url_for("hosted_mobile_apollo"))
 
-    @app.route("/hosted/mobile/trades", methods=["GET"])
-    def hosted_mobile_trades() -> Any:
-        return redirect(url_for("hosted_mobile_home"))
-
-    @app.route("/hosted/mobile/performance", methods=["GET"])
-    def hosted_mobile_performance() -> Any:
-        return render_hosted_mobile_shell("performance")
-
-    @app.route("/hosted/mobile/journal", methods=["GET"])
-    def hosted_mobile_journal() -> Any:
-        return render_hosted_mobile_shell("journal")
-
-    @app.post("/hosted/mobile/journal/create")
-    def hosted_mobile_journal_create() -> Any:
-        _, error_response = authorize_hosted_private_browser_request(app)
-        if error_response is not None:
-            return error_response
-        submitted_values = coerce_trade_form_input(request.form)
-        trade_store = get_trade_store(app)
-        try:
-            trade_id = trade_store.create_trade(submitted_values)
-            created_trade = dict(submitted_values)
-            created_trade.setdefault("id", trade_id)
-            created_trade["trade_mode"] = str(submitted_values.get("trade_mode") or "real")
-            _clear_hosted_payload_cache(app=app)
-            save_message, save_level = build_trade_save_status(created_trade, action="saved")
-            set_status_message(save_message, level=save_level)
-        except SupabaseRequestError as exc:
-            set_status_message(str(exc), level="warning")
-        except ValueError as exc:
-            set_status_message(str(exc), level="warning")
-        return redirect(url_for("hosted_mobile_journal"))
-
-    @app.route("/hosted/mobile/more", methods=["GET"])
-    def hosted_mobile_more() -> Any:
-        return redirect(url_for("hosted_mobile_home"))
-
-    @app.post("/hosted/mobile/run/<engine>")
+    @app.route("/hosted/mobile/actions/<engine>/run", methods=["POST"])
     def hosted_mobile_run_action(engine: str) -> Any:
-        _, error_response = authorize_hosted_private_browser_request(app)
+        identity, error_response = authorize_hosted_private_browser_request(app)
         if error_response is not None:
             return error_response
-        redirect_target = sanitize_hosted_next_path(request.form.get("next") or url_for("hosted_mobile_home"))
         normalized_engine = str(engine or "").strip().lower()
         route_entered = request.path
+        redirect_target = sanitize_hosted_next_path(request.form.get("next") or url_for("hosted_mobile_home"))
         try:
             if normalized_engine == "apollo":
                 _clear_hosted_payload_cache("hosted:apollo:live", app=app)
@@ -909,12 +1303,13 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 )
                 set_status_message("Apollo refreshed for Talos Mobile.", level="info")
                 app.logger.info(
-                    "Hosted mobile Apollo flow | route_entered=%s | action=run-live | redirect_target=%s | payload_created=%s | result_state_stored_session=%s | result_state_stored_cache=%s",
+                    "Hosted mobile Apollo flow | route_entered=%s | action=run-live | redirect_target=%s | payload_created=%s | result_state_stored_session=%s | result_state_stored_cache=%s | email=%s",
                     route_entered,
                     redirect_target,
                     bool(apollo_payload),
                     True,
                     True,
+                    identity.email,
                 )
             elif normalized_engine == "kairos":
                 abort(404)
@@ -942,7 +1337,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
     def hosted_browser_sign_out() -> Any:
         if app.config.get("RUNTIME_TARGET") != "hosted":
             abort(404)
-        response = redirect(build_hosted_launch_url())
+        response = redirect(url_for("hosted_login_entry", next=url_for("hosted_shell_home")))
         invalidate_hosted_browser_cache_session(response, app=app)
         clear_hosted_browser_session()
         mark_hosted_force_reauth()
@@ -987,7 +1382,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         _, error_response = authorize_hosted_private_action_request(app)
         if error_response is not None:
             return error_response
-        filters = parse_performance_request_filters(request.args)
+        filters = enforce_hosted_talos_performance_filters(parse_performance_request_filters(request.args))
         try:
             return jsonify(build_hosted_performance_summary_action_response(filters=filters, app=app))
         except SupabaseRequestError as exc:
@@ -1000,7 +1395,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         _, error_response = authorize_hosted_private_action_request(app)
         if error_response is not None:
             return error_response
-        filters = parse_performance_request_filters(request.args)
+        filters = enforce_hosted_talos_performance_filters(parse_performance_request_filters(request.args))
         try:
             payload = build_hosted_performance_dashboard(filters=filters, app=app)
             log_hosted_performance_trace(route_label=request.path, filters=filters, payload=payload, app=app)
@@ -1070,17 +1465,14 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.route("/hosted", methods=["GET"])
     def hosted_shell_home() -> Any:
-        identity, error_response = authorize_hosted_private_browser_request(app)
-        if error_response is not None:
-            return error_response
-        return redirect(url_for("hosted_shell_manage_trades"))
+        return hosted_shell_manage_trades()
 
     @app.route("/hosted/performance", methods=["GET"])
     def hosted_shell_performance() -> Any:
         identity, error_response = authorize_hosted_private_browser_request(app)
         if error_response is not None:
             return error_response
-        filters = parse_performance_request_filters(request.args)
+        filters = enforce_hosted_talos_performance_filters(parse_performance_request_filters(request.args))
         admin_error = get_hosted_storage_preflight_error("performance", app=app)
         if admin_error is None:
             try:
@@ -1096,11 +1488,14 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         response = render_template(
             "performance.html",
             dashboard_payload=dashboard_payload,
-            filter_groups=PERFORMANCE_FILTER_GROUPS,
+            filter_groups=build_hosted_talos_performance_filter_groups(),
             error_message=admin_error["detail"] if admin_error else None,
             info_message=pop_status_message(),
             hosted_admin_error=admin_error,
-            performance_data_url=build_hosted_performance_url("hosted_performance_data", filters=normalize_requested_performance_filters(filters)),
+            performance_data_url=build_hosted_performance_url(
+                "hosted_performance_data",
+                filters=enforce_hosted_talos_performance_filters(normalize_requested_performance_filters(filters)),
+            ),
             **build_hosted_template_context(identity),
         )
         return (response, 503) if admin_error else response
@@ -1110,7 +1505,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         identity, error_response = authorize_hosted_private_browser_request(app)
         if error_response is not None:
             return error_response
-        trade_mode = resolve_trade_mode(request.args.get("trade_mode") or "real")
+        reconcile_talos_runtime_state(caller_source="hosted-journal")
+        trade_mode = "talos"
         info_message = pop_status_message()
         prefill_requested = str(request.args.get("prefill", "")).strip().lower() in {"1", "true", "yes", "on"}
         admin_error = get_hosted_storage_preflight_error("journal", app=app, trade_mode=trade_mode)
@@ -1126,6 +1522,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 info_message=info_message,
                 prefill_active=False,
                 hosted_prefill_enabled=True,
+                available_trade_modes=("talos",),
+                filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
             )
             return render_hosted_journal_page(identity=identity, context=context, admin_error=admin_error, app=app)
 
@@ -1170,6 +1568,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                     prefill_active=bool(prefill_source),
                     prefill_notice=prefill_meta["notice"] if prefill_source else "",
                     hosted_prefill_enabled=True,
+                    available_trade_modes=("talos",),
+                    filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
                 )
                 return render_hosted_journal_page(identity=identity, context=context, admin_error=admin_error, app=app)
             except ValueError as exc:
@@ -1187,6 +1587,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                     prefill_active=bool(prefill_source),
                     prefill_notice=prefill_meta["notice"] if prefill_source else "",
                     hosted_prefill_enabled=True,
+                    available_trade_modes=("talos",),
+                    filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
                 )
                 return render_hosted_journal_page(identity=identity, context=context, app=app)
 
@@ -1217,6 +1619,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 prefill_active=prefill_active,
                 prefill_notice=prefill_notice,
                 hosted_prefill_enabled=True,
+                available_trade_modes=("talos",),
+                filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
             )
         except SupabaseRequestError as exc:
             if not is_missing_hosted_trade_table_error(exc):
@@ -1234,12 +1638,14 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 prefill_active=prefill_active,
                 prefill_notice=prefill_notice,
                 hosted_prefill_enabled=True,
+                available_trade_modes=("talos",),
+                filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
             )
         return render_hosted_journal_page(identity=identity, context=context, admin_error=admin_error, app=app)
 
     @app.route("/hosted/trades", methods=["GET"])
     def hosted_shell_trades_redirect() -> Any:
-        return redirect(url_for("hosted_shell_journal", trade_mode="real", **request.args.to_dict(flat=False)))
+        return redirect(url_for("hosted_shell_journal", trade_mode="talos", **request.args.to_dict(flat=False)))
 
     @app.route("/hosted/journal/<trade_mode>/<int:trade_id>/edit", methods=["GET", "POST"])
     def hosted_trade_edit(trade_mode: str, trade_id: int) -> Any:
@@ -1261,6 +1667,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 error_message=admin_error["detail"],
                 info_message=info_message,
                 prefill_active=False,
+                available_trade_modes=("talos",),
+                filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
             )
             return render_hosted_journal_page(identity=identity, context=context, admin_error=admin_error, app=app)
 
@@ -1281,6 +1689,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 error_message=admin_error["detail"],
                 info_message=info_message,
                 prefill_active=False,
+                available_trade_modes=("talos",),
+                filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
             )
             return render_hosted_journal_page(identity=identity, context=context, admin_error=admin_error, app=app)
 
@@ -1317,6 +1727,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                     error_message=admin_error["detail"],
                     info_message=info_message,
                     prefill_active=False,
+                    available_trade_modes=("talos",),
+                    filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
                 )
                 return render_hosted_journal_page(identity=identity, context=context, admin_error=admin_error, app=app)
             except ValueError as exc:
@@ -1331,6 +1743,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                     error_message=str(exc),
                     info_message=info_message,
                     prefill_active=False,
+                    available_trade_modes=("talos",),
+                    filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
                 )
                 return render_hosted_journal_page(identity=identity, context=context, app=app)
 
@@ -1348,6 +1762,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             error_message=None,
             info_message=info_message,
             prefill_active=False,
+            available_trade_modes=("talos",),
+            filter_groups=HOSTED_TALOS_TRADE_FILTER_GROUPS,
         )
         return render_hosted_journal_page(identity=identity, context=context, app=app)
 
@@ -1384,13 +1800,15 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.route("/hosted/manage-trades", methods=["GET"])
     def hosted_shell_manage_trades() -> Any:
+        started = time.perf_counter()
         identity, error_response = authorize_hosted_private_browser_request(app)
         if error_response is not None:
             return error_response
+        reconcile_talos_runtime_state(caller_source="hosted-manage-trades")
         admin_error = get_hosted_storage_preflight_error("manage-trades", app=app)
         if admin_error is None:
             try:
-                management_payload = build_hosted_open_trade_management_payload(app=app)
+                management_payload = build_hosted_open_trade_management_payload(app=app, talos_only=True)
             except SupabaseRequestError as exc:
                 if not is_missing_hosted_trade_table_error(exc):
                     raise
@@ -1405,72 +1823,30 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             info_message=pop_status_message(),
             management_actions_enabled=True,
             management_action_urls={
-                "real_status_update": url_for("hosted_open_trade_management_status_update", trade_mode="real"),
-                "simulated_status_update": url_for("hosted_open_trade_management_status_update", trade_mode="simulated"),
                 "prefill_close": "hosted_open_trade_management_prefill_close",
             },
             suppress_open_positions_copy=True,
             hosted_admin_error=admin_error,
             **build_hosted_template_context(identity),
         )
+        get_runtime_metrics_service().record(
+            "/hosted/manage-trades",
+            (time.perf_counter() - started) * 1000.0,
+            detail=("admin-error" if admin_error else "ok"),
+        )
         return (response, 503) if admin_error else response
 
     @app.get("/hosted/notifications")
     def hosted_notifications_settings_page() -> Any:
-        identity, error_response = authorize_hosted_private_browser_request(app)
-        if error_response is not None:
-            return error_response
-        settings = get_global_notification_settings_repository(app).load_settings()
-        return render_template(
-            "notifications_settings.html",
-            notification_settings=settings,
-            notification_settings_map={item["key"]: item for item in settings if item.get("key")},
-            save_action_url=url_for("hosted_notifications_settings_save"),
-            back_url=url_for("hosted_shell_manage_trades"),
-            active_page="management",
-            info_message=pop_status_message(),
-            **build_hosted_template_context(identity, app=app),
-        )
+        abort(404)
 
     @app.post("/hosted/notifications")
     def hosted_notifications_settings_save() -> Any:
-        identity, error_response = authorize_hosted_private_browser_request(app)
-        if error_response is not None:
-            return error_response
-        settings = coerce_global_notification_settings_input(request.form)
-        get_global_notification_settings_repository(app).save_settings(settings)
-        _clear_hosted_payload_cache("hosted:open-trades", app=app)
-        set_status_message("Notification settings saved.", level="info")
-        return redirect(url_for("hosted_notifications_settings_page"))
+        abort(404)
 
     @app.post("/hosted/manage-trades/status-update/<trade_mode>")
     def hosted_open_trade_management_status_update(trade_mode: str) -> Any:
-        identity, error_response = authorize_hosted_private_browser_request(app)
-        if error_response is not None:
-            return error_response
-        normalized_trade_mode = str(trade_mode or "").strip().lower()
-        if normalized_trade_mode not in {"real", "simulated"}:
-            abort(404)
-        result = get_open_trade_manager(app).send_manual_status_update(trade_mode=normalized_trade_mode)
-        trade_mode_label = "real" if normalized_trade_mode == "real" else "simulated"
-        if result["sent"]:
-            suffix = " Automatic notifications remain OFF." if not get_open_trade_manager(app).notifications_enabled() else ""
-            set_status_message(
-                f"Sent Pushover status update for {result['record_count']} {trade_mode_label} open trade(s).{suffix}",
-                level="info",
-            )
-        elif result["record_count"] == 0:
-            set_status_message(
-                f"No open {trade_mode_label} trades are available for a status update.",
-                level="warning",
-            )
-        else:
-            set_status_message(
-                f"Pushover {trade_mode_label} status update failed: {result['error'] or 'Unable to send notification.'}",
-                level="warning",
-            )
-        _clear_hosted_payload_cache("hosted:open-trades", app=app)
-        return redirect(url_for("hosted_shell_manage_trades"))
+        abort(404)
 
     @app.post("/hosted/manage-trades/<int:trade_id>/prefill-close")
     def hosted_open_trade_management_prefill_close(trade_id: int) -> Any:
@@ -1588,7 +1964,16 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 except Exception as exc:  # pragma: no cover - defensive logging
                     error_message = "Hosted Apollo live execution failed unexpectedly."
                     app.logger.exception("Unexpected hosted Apollo autorun error: %s", exc)
-        apollo_render_state = resolve_hosted_apollo_render_state(app=app)
+        if error_message:
+            apollo_render_state = {
+                "payload": build_hosted_apollo_error_payload(error_message),
+                "payload_source": "live-error",
+                "cache_key": "hosted:apollo:error",
+                "payload_id": "hosted-apollo-error",
+                "source_object": "hosted:apollo:error",
+            }
+        else:
+            apollo_render_state = resolve_hosted_apollo_render_state(app=app)
         apollo_result = apollo_render_state["payload"]
         app.logger.info(
             "Hosted Apollo desktop render | route_entered=%s | payload_source=%s | payload_id=%s | cache_key=%s | source_object=%s",
@@ -1615,6 +2000,79 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             hosted_apollo_prefill_url=url_for("hosted_apollo_prefill_candidate"),
             **build_hosted_template_context(identity, app=app),
         )
+
+    @app.get("/hosted/talos")
+    def hosted_shell_talos() -> Any:
+        identity, error_response = authorize_hosted_private_browser_request(app)
+        if error_response is not None:
+            return error_response
+        force_refresh = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes", "on"}
+        return render_talos_page(hosted_mode=True, identity=identity, force_refresh=force_refresh)
+
+    @app.post("/hosted/talos/actions/update")
+    def hosted_talos_update_settings() -> Any:
+        _, error_response = authorize_hosted_private_action_request(app)
+        if error_response is not None:
+            return error_response
+        result = get_talos_engine(app).update_settings(request.form)
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("hosted_shell_talos"))
+
+    @app.post("/hosted/talos/actions/manual-execution")
+    def hosted_talos_manual_execution() -> Any:
+        _, error_response = authorize_hosted_private_action_request(app)
+        if error_response is not None:
+            return error_response
+        result = get_talos_engine(app).queue_manual_execution_test(request.form)
+        set_status_message(result["message"], level=result.get("level", "info"))
+        if result.get("ok") and result.get("prefill") and result.get("redirect_mode"):
+            redirect_mode = str(result["redirect_mode"])
+            store_trade_prefill(redirect_mode, result["prefill"])
+            return redirect(url_for("hosted_shell_journal", trade_mode=redirect_mode, prefill=1, _anchor="trade-entry-form"))
+        return redirect(url_for("hosted_shell_talos"))
+
+    @app.post("/hosted/talos/actions/simulated-open-check")
+    def hosted_talos_simulated_open_check() -> Any:
+        _, error_response = authorize_hosted_private_action_request(app)
+        if error_response is not None:
+            return error_response
+        result = get_talos_engine(app).run_simulated_open_check(trigger_reason="manual-button")
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("hosted_shell_talos"))
+
+    @app.post("/hosted/talos/actions/simulated-close-check")
+    def hosted_talos_simulated_close_check() -> Any:
+        _, error_response = authorize_hosted_private_action_request(app)
+        if error_response is not None:
+            return error_response
+        result = get_talos_engine(app).run_simulated_close_check(trigger_reason="manual-button")
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("hosted_shell_talos"))
+
+    @app.post("/hosted/talos/actions/real-open-check")
+    def hosted_talos_real_open_check() -> Any:
+        _, error_response = authorize_hosted_private_action_request(app)
+        if error_response is not None:
+            return error_response
+        result = get_talos_engine(app).run_real_open_check(
+            trigger_reason="manual-button",
+            confirmation_text=str(request.form.get("real_order_confirmation_text") or ""),
+        )
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("hosted_shell_talos"))
+
+    @app.post("/hosted/talos/actions/real-close-check")
+    def hosted_talos_real_close_check() -> Any:
+        _, error_response = authorize_hosted_private_action_request(app)
+        if error_response is not None:
+            return error_response
+        result = get_talos_engine(app).run_real_close_check(
+            trigger_reason="manual-button",
+            confirmation_text=str(request.form.get("real_order_confirmation_text") or ""),
+            manual_override=str(request.form.get("manual_close_override") or "").strip().lower() in {"1", "true", "yes", "on"},
+        )
+        set_status_message(result["message"], level=result.get("level", "info"))
+        return redirect(url_for("hosted_shell_talos"))
 
     @app.route("/hosted/kairos", methods=["GET"])
     def hosted_shell_kairos() -> Any:
@@ -1734,7 +2192,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             store_trade_prefill("real", prefill)
             set_status_message("Kairos live trade data is loaded into a journal draft. Review it before saving.", level="info")
             if hosted_mode:
-                payload["redirect_url"] = url_for("hosted_shell_journal", trade_mode="real", prefill=1, _anchor="trade-entry-form")
+                payload["redirect_url"] = url_for("hosted_shell_journal", trade_mode="talos", prefill=1, _anchor="trade-entry-form")
             else:
                 payload["redirect_url"] = url_for("trade_dashboard", trade_mode="real", prefill=1, _anchor="trade-entry-form")
         return payload
@@ -1847,36 +2305,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.post("/api/text-status")
     def text_status_api() -> Any:
-        display_name = str(app.config.get("APP_DISPLAY_NAME") or APP_CONFIG.app_display_name or "Talos").strip() or "Talos"
-        title_display_name = display_name[:-4] if display_name.endswith(" Dev") else display_name
-        title = f"{title_display_name} Test Alert"
-        if not open_trade_manager.notifications_enabled():
-            return jsonify({"ok": False, "error": "Notifications are currently OFF.", "title": title}), 409
-        status_timestamp = datetime.now(CHICAGO_TZ)
-        spx_snapshot = get_status_snapshot(market_data_service, "^GSPC", query_type="pushover_status_spx")
-        vix_snapshot = get_status_snapshot(market_data_service, "^VIX", query_type="pushover_status_vix")
-        message = build_pushover_test_message(
-            spx_snapshot=spx_snapshot,
-            vix_snapshot=vix_snapshot,
-            generated_at=status_timestamp,
-            source_label=display_name,
-        )
-        result = pushover_service.send_notification(title=title, message=message, priority=0)
-        status_code = int(result.get("status_code") or 200)
-        if result.get("ok"):
-            app.logger.info("Manual %s Pushover test notification sent.", display_name)
-        else:
-            app.logger.warning(
-                "Manual %s Pushover test notification failed: %s",
-                display_name,
-                result.get("error") or "Unknown error",
-            )
-        response_payload = {
-            key: value for key, value in result.items() if key not in {"status_code"}
-        }
-        response_payload["title"] = title
-        response_payload["message_body"] = message
-        return jsonify(response_payload), status_code
+        abort(404)
 
     @app.post("/kairos/activate", endpoint="kairos_activate")
     @app.post("/kairos/live/activate", endpoint="kairos_live_activate")
@@ -2047,6 +2476,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.route("/apollo", methods=["GET", "POST"])
     def run_apollo():
+        if app.config.get("RUNTIME_TARGET") == "hosted":
+            return redirect(url_for("hosted_shell_apollo", **request.args.to_dict(flat=False)), code=(307 if request.method == "POST" else 302))
         form_data = get_form_data(request.form if request.method == "POST" else None)
         error_message = None
         apollo_result = None
@@ -2073,6 +2504,9 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             except Exception as exc:  # pragma: no cover - defensive logging
                 error_message = "An unexpected error occurred while running Apollo. Check the log for details."
                 app.logger.exception("Unexpected Apollo error: %s", exc)
+
+        if apollo_result is None and error_message is None:
+            apollo_result = get_apollo_snapshot_repository(app).load_snapshot()
 
         response = render_apollo_page(
             form_data=form_data,
@@ -2180,7 +2614,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             runtime_app_config.app_display_name,
             runtime_app_config.app_port,
             runtime_app_config.schwab_redirect_uri,
-            getattr(auth_service.token_store, "file_path", runtime_app_config.schwab_token_path),
+            getattr(auth_service.token_store, "file_path", runtime_app_config.schwab_shared_market_token_path),
             runtime_app_config.session_cookie_name,
             runtime_app_config.oauth_session_namespace,
             mask_oauth_state(state),
@@ -2202,7 +2636,9 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         provider = market_data_service.provider
         if not hasattr(provider, "auth_service"):
             set_status_message("The active market data provider does not support OAuth callbacks.", level="error")
-            return redirect(url_for("index"))
+            redirect_target = resolve_post_oauth_redirect_target(runtime_app_config)
+            app.logger.warning("OAuth callback unsupported provider | redirect_target=%s", redirect_target)
+            return redirect(redirect_target)
 
         oauth_session_keys = app.extensions["oauth_session_keys"]
         workflow_state = get_workflow_state(app)
@@ -2213,7 +2649,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             runtime_app_config.app_display_name,
             runtime_app_config.app_port,
             runtime_app_config.schwab_redirect_uri,
-            getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_token_path),
+            getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_shared_market_token_path),
             runtime_app_config.session_cookie_name,
             runtime_app_config.oauth_session_namespace,
             bool(authorization_code),
@@ -2225,7 +2661,9 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             workflow_state.put(oauth_session_keys["login_in_progress"], False)
             workflow_state.put(oauth_session_keys["callback_pending"], False)
             set_status_message(f"Schwab authorization failed: {error}", level="error")
-            return redirect(url_for("index"))
+            redirect_target = resolve_post_oauth_redirect_target(runtime_app_config)
+            app.logger.warning("OAuth callback returned provider error | redirect_target=%s | detail=%s", redirect_target, error)
+            return redirect(redirect_target)
 
         expected_state = workflow_state.pop(oauth_session_keys["oauth_state"], None)
         workflow_state.pop("schwab_oauth_state", None)
@@ -2240,19 +2678,21 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 runtime_app_config.app_display_name,
                 runtime_app_config.app_port,
                 runtime_app_config.schwab_redirect_uri,
-                getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_token_path),
+                getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_shared_market_token_path),
                 runtime_app_config.oauth_session_namespace,
                 mask_oauth_state(expected_state),
                 mask_oauth_state(received_state),
             )
             set_status_message("Schwab authorization state did not match. Please try again.", level="error")
-            return redirect(url_for("index"))
+            redirect_target = resolve_post_oauth_redirect_target(runtime_app_config)
+            app.logger.warning("OAuth callback state mismatch redirect | redirect_target=%s", redirect_target)
+            return redirect(redirect_target)
         app.logger.info(
             "OAuth state validation passed | env=%s | port=%s | redirect_uri=%s | token_target_path=%s | oauth_namespace=%s | oauth_state=%s",
             runtime_app_config.app_display_name,
             runtime_app_config.app_port,
             runtime_app_config.schwab_redirect_uri,
-            getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_token_path),
+            getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_shared_market_token_path),
             runtime_app_config.oauth_session_namespace,
             mask_oauth_state(received_state),
         )
@@ -2261,37 +2701,69 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             workflow_state.put(oauth_session_keys["login_in_progress"], False)
             workflow_state.put(oauth_session_keys["callback_pending"], False)
             set_status_message("Schwab did not return an authorization code.", level="error")
-            return redirect(url_for("index"))
+            redirect_target = resolve_post_oauth_redirect_target(runtime_app_config)
+            app.logger.warning("OAuth callback missing code | redirect_target=%s", redirect_target)
+            return redirect(redirect_target)
 
+        redirect_target = resolve_post_oauth_redirect_target(runtime_app_config)
         try:
+            app.logger.info(
+                "Schwab token exchange attempted | env=%s | port=%s | token_target_path=%s | redirect_target=%s",
+                runtime_app_config.app_display_name,
+                runtime_app_config.app_port,
+                getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_shared_market_token_path),
+                redirect_target,
+            )
             provider.auth_service.exchange_code_for_tokens(authorization_code)
+            persisted_token = validate_persisted_schwab_token(provider.auth_service)
             workflow_state.put(oauth_session_keys["login_in_progress"], False)
             workflow_state.put(oauth_session_keys["callback_pending"], False)
             workflow_state.put(oauth_session_keys["connected"], True)
             workflow_state.put(oauth_session_keys["authorized"], True)
             workflow_state.pop(oauth_session_keys["pkce_verifier"], None)
             set_status_message("Connected to Schwab successfully.", level="info")
+            app.logger.info(
+                "Schwab token exchange succeeded | env=%s | port=%s | token_target_path=%s | token_file_exists=%s | expires_at=%s | refresh_expires_at=%s | redirect_target=%s",
+                runtime_app_config.app_display_name,
+                runtime_app_config.app_port,
+                getattr(provider.auth_service.token_store, "file_path", runtime_app_config.schwab_shared_market_token_path),
+                bool(
+                    isinstance(getattr(provider.auth_service.token_store, "file_path", None), Path)
+                    and getattr(provider.auth_service.token_store, "file_path").exists()
+                ),
+                persisted_token.get("expires_at"),
+                persisted_token.get("refresh_expires_at"),
+                redirect_target,
+            )
         except Exception as exc:
             workflow_state.put(oauth_session_keys["login_in_progress"], False)
             workflow_state.put(oauth_session_keys["callback_pending"], False)
             workflow_state.put(oauth_session_keys["connected"], False)
             workflow_state.put(oauth_session_keys["authorized"], False)
             set_status_message(str(exc), level="error")
-            app.logger.warning("Schwab token exchange failed: %s", exc)
+            token_file_path = getattr(provider.auth_service.token_store, "file_path", None)
+            app.logger.warning(
+                "Schwab token exchange failed | detail=%s | token_target_path=%s | token_file_exists=%s | redirect_target=%s",
+                exc,
+                token_file_path or runtime_app_config.schwab_shared_market_token_path,
+                bool(isinstance(token_file_path, Path) and token_file_path.exists()),
+                redirect_target,
+            )
 
-        return redirect(url_for("index"))
+        app.logger.info("OAuth callback redirecting | redirect_target=%s", redirect_target)
+        return redirect(redirect_target)
 
     @app.get("/journal")
     def journal_dashboard() -> Any:
         if app.config.get("RUNTIME_TARGET") == "hosted":
-            return redirect(url_for("hosted_shell_journal", trade_mode="real", **request.args.to_dict(flat=False)))
+            return redirect(url_for("hosted_shell_journal", trade_mode="talos", **request.args.to_dict(flat=False)))
         return redirect(url_for("trade_dashboard", trade_mode="real", **request.args.to_dict(flat=False)))
 
     @app.get("/trades/<trade_mode>")
     def trade_dashboard(trade_mode: str):
         normalized_mode = resolve_trade_mode(trade_mode)
         if app.config.get("RUNTIME_TARGET") == "hosted":
-            return redirect(url_for("hosted_shell_journal", trade_mode=normalized_mode, **request.args.to_dict(flat=False)))
+            return redirect(url_for("hosted_shell_journal", trade_mode="talos", **request.args.to_dict(flat=False)))
         prefill_requested = str(request.args.get("prefill", "")).strip().lower() in {"1", "true", "yes", "on"}
         form_values = blank_trade_form(normalized_mode)
         form_values["trade_number"] = str(trade_store.next_trade_number())
@@ -2637,8 +3109,6 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             info_message=pop_status_message(),
             management_actions_enabled=True,
             management_action_urls={
-                "real_status_update": url_for("open_trade_management_status_update", trade_mode="real"),
-                "simulated_status_update": url_for("open_trade_management_status_update", trade_mode="simulated"),
                 "prefill_close": "open_trade_management_prefill_close",
             },
         )
@@ -2646,48 +3116,15 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
     @app.get("/notifications")
     def notifications_settings_page() -> str:
-        settings = get_global_notification_settings_repository(app).load_settings()
-        return render_template(
-            "notifications_settings.html",
-            notification_settings=settings,
-            notification_settings_map={item["key"]: item for item in settings if item.get("key")},
-            save_action_url=url_for("notifications_settings_save"),
-            back_url=url_for("open_trade_management_page"),
-            active_page="management",
-            info_message=pop_status_message(),
-        )
+        abort(404)
 
     @app.post("/notifications")
     def notifications_settings_save() -> Any:
-        settings = coerce_global_notification_settings_input(request.form)
-        get_global_notification_settings_repository(app).save_settings(settings)
-        set_status_message("Notification settings saved.", level="info")
-        return redirect(url_for("notifications_settings_page"))
+        abort(404)
 
     @app.post("/management/open-trades/status-update/<trade_mode>")
     def open_trade_management_status_update(trade_mode: str) -> Any:
-        normalized_trade_mode = str(trade_mode or "").strip().lower()
-        if normalized_trade_mode not in {"real", "simulated"}:
-            abort(404)
-        result = open_trade_manager.send_manual_status_update(trade_mode=normalized_trade_mode)
-        trade_mode_label = "real" if normalized_trade_mode == "real" else "simulated"
-        if result["sent"]:
-            suffix = " Automatic notifications remain OFF." if not open_trade_manager.notifications_enabled() else ""
-            set_status_message(
-                f"Sent Pushover status update for {result['record_count']} {trade_mode_label} open trade(s).{suffix}",
-                level="info",
-            )
-        elif result["record_count"] == 0:
-            set_status_message(
-                f"No open {trade_mode_label} trades are available for a status update.",
-                level="warning",
-            )
-        else:
-            set_status_message(
-                f"Pushover {trade_mode_label} status update failed: {result['error'] or 'Unable to send notification.'}",
-                level="warning",
-            )
-        return redirect(url_for("open_trade_management_page"))
+        abort(404)
 
     @app.post("/management/open-trades/<int:trade_id>/prefill-close")
     def open_trade_management_prefill_close(trade_id: int) -> Any:
@@ -2794,7 +3231,7 @@ def build_startup_menu_payload(
     requires_auth = bool(provider_meta.get("requires_auth"))
     authenticated = bool(provider_meta.get("authenticated", True))
     notes: list[str] = []
-    auth_status = {"requires_login": False, "requires_refresh": False}
+    auth_status = resolve_schwab_connection_status(market_data_service)
     snapshot_overrides = snapshot_overrides or {}
 
     def _snapshot_card(label: str, ticker: str, key: str) -> Dict[str, str]:
@@ -2810,23 +3247,25 @@ def build_startup_menu_payload(
             }
         except MarketDataReauthenticationRequired:
             auth_status["requires_refresh"] = True
-            notes.append(f"{label} unavailable until the Schwab session is refreshed.")
+            auth_status["connected"] = False
+            notes.append(f"{label} unavailable until the Schwab token is refreshed.")
             return {
                 "label": label,
                 "value": "—",
                 "value_trend": "neutral",
                 "change": "Change unavailable",
-                "meta": "Session refresh required",
+                "meta": "Schwab token expired",
             }
         except MarketDataAuthenticationError:
             auth_status["requires_login"] = True
-            notes.append(f"{label} unavailable until Schwab login is completed.")
+            auth_status["connected"] = False
+            notes.append(f"{label} unavailable until Schwab authentication is completed.")
             return {
                 "label": label,
                 "value": "—",
                 "value_trend": "neutral",
                 "change": "Change unavailable",
-                "meta": "Login required",
+                "meta": "Schwab auth required",
             }
         except MarketDataError as exc:
             notes.append(f"{label} unavailable: {exc}")
@@ -2847,19 +3286,22 @@ def build_startup_menu_payload(
                 "meta": "Unavailable",
             }
 
-    connection_meta = provider_meta.get("live_provider_name", "Unknown Provider")
+    connection_meta = auth_status["status_meta"]
     cards = [
         _snapshot_card("SPX", "^GSPC", "spx"),
         _snapshot_card("VIX", "^VIX", "vix"),
     ]
 
-    connection_label = "Connected"
+    connection_label = auth_status["status_label"]
     if auth_status["requires_refresh"]:
-        connection_label = "Session refresh required"
+        connection_label = "Schwab token expired"
+        connection_meta = "Schwab auth required"
     elif auth_status["requires_login"] or (requires_auth and not authenticated):
-        connection_label = "Login required"
+        connection_label = "Schwab auth required"
+        connection_meta = "Schwab not connected"
     elif not requires_auth:
-        connection_label = "Ready"
+        connection_label = "Connected"
+        connection_meta = "Schwab"
 
     cards.append(
         {
@@ -2875,9 +3317,81 @@ def build_startup_menu_payload(
         "brand_name": "Talos",
         "connection_label": connection_label,
         "connection_meta": connection_meta,
-        "connection_requires_login": auth_status["requires_login"] or (requires_auth and not authenticated),
+        "connection_requires_login": (auth_status["requires_login"] or auth_status["requires_refresh"] or (requires_auth and not authenticated)),
         "cards": cards,
         "notes": notes,
+    }
+
+
+def resolve_schwab_connection_status(market_data_service: MarketDataService) -> Dict[str, Any]:
+    provider_meta = market_data_service.get_provider_metadata()
+    provider_key = str(provider_meta.get("live_provider_key") or "").strip().lower()
+    requires_auth = bool(provider_meta.get("requires_auth", True))
+    provider = getattr(market_data_service, "live_provider", None)
+    auth_service = getattr(provider, "auth_service", None)
+
+    if provider_key != "schwab":
+        return {
+            "connected": False,
+            "requires_login": True,
+            "requires_refresh": False,
+            "status_label": "Schwab not connected",
+            "status_meta": "Schwab only",
+        }
+
+    if not requires_auth:
+        return {
+            "connected": True,
+            "requires_login": False,
+            "requires_refresh": False,
+            "status_label": "Connected",
+            "status_meta": "Schwab",
+        }
+
+    if auth_service is not None and hasattr(auth_service, "get_connection_status"):
+        return auth_service.get_connection_status()
+
+    token_store = getattr(auth_service, "token_store", None)
+    token_payload = token_store.load() if token_store is not None and hasattr(token_store, "load") else {}
+    access_token = str((token_payload or {}).get("access_token") or "").strip()
+    expires_at_raw = str((token_payload or {}).get("expires_at") or "").strip()
+
+    if not access_token or not expires_at_raw:
+        return {
+            "connected": False,
+            "requires_login": True,
+            "requires_refresh": False,
+            "status_label": "Schwab auth required",
+            "status_meta": "Schwab not connected",
+        }
+
+    try:
+        expires_at = datetime.fromisoformat(expires_at_raw)
+    except ValueError:
+        return {
+            "connected": False,
+            "requires_login": True,
+            "requires_refresh": False,
+            "status_label": "Schwab auth required",
+            "status_meta": "Schwab not connected",
+        }
+
+    token_expired = (datetime.now(expires_at.tzinfo) >= expires_at) if expires_at.tzinfo is not None else (datetime.utcnow() >= expires_at)
+    if token_expired:
+        return {
+            "connected": False,
+            "requires_login": False,
+            "requires_refresh": True,
+            "status_label": "Schwab token expired",
+            "status_meta": "Schwab auth required",
+        }
+
+    return {
+        "connected": True,
+        "requires_login": False,
+        "requires_refresh": False,
+        "status_label": "Connected",
+        "status_meta": "Schwab",
     }
 
 
@@ -2916,9 +3430,9 @@ def get_status_snapshot(market_data_service: MarketDataService, ticker: str, *, 
             builder=lambda: market_data_service.get_latest_snapshot(ticker, query_type=query_type),
         )
     except MarketDataReauthenticationRequired:
-        return {"status_unavailable": True, "status_note": "Session refresh required"}
+        return {"status_unavailable": True, "status_note": "Schwab token expired"}
     except MarketDataAuthenticationError:
-        return {"status_unavailable": True, "status_note": "Login required"}
+        return {"status_unavailable": True, "status_note": "Schwab auth required"}
     except MarketDataError as exc:
         return {"status_unavailable": True, "status_note": str(exc)}
     except Exception:
@@ -2982,6 +3496,19 @@ def parse_performance_request_filters(source: Any) -> Dict[str, list[str]]:
         if value:
             filters[key] = [value]
     return filters
+
+
+def enforce_hosted_talos_performance_filters(filters: Optional[Dict[str, list[str]]] = None) -> Dict[str, list[str]]:
+    normalized = normalize_requested_performance_filters(filters or {})
+    normalized["system"] = ["talos"]
+    return normalized
+
+
+def build_hosted_talos_performance_filter_groups() -> Dict[str, list[str]]:
+    return {
+        **PERFORMANCE_FILTER_GROUPS,
+        "system": ["Talos"],
+    }
 
 
 def normalize_requested_performance_filters(filters: Optional[Dict[str, list[str]]] = None) -> Dict[str, list[str]]:
@@ -3314,7 +3841,7 @@ def authorize_hosted_private_browser_request(app: Optional[Flask] = None) -> tup
     try:
         return require_hosted_private_access(app), None
     except AuthenticationRequiredError:
-        return None, redirect(build_hosted_launch_url(next_path=build_hosted_browser_next_path()))
+        return None, redirect(url_for("hosted_login_entry", next=build_hosted_browser_next_path()))
     except PrivateAccessDeniedError as exc:
         return None, (
             render_template(
@@ -3482,13 +4009,12 @@ def render_hosted_journal_page(
     hosted_context["trade_modes"] = [
         item
         for item in (context.get("trade_modes") or [])
-        if str(item.get("key") or "") in {"real", "simulated"}
+        if str(item.get("key") or "") == "talos"
     ]
     response = render_template(
         "trades.html",
         trade_mode_links={
-            "real": url_for("hosted_shell_journal", trade_mode="real"),
-            "simulated": url_for("hosted_shell_journal", trade_mode="simulated"),
+            "talos": url_for("hosted_shell_journal", trade_mode="talos"),
         },
         hosted_read_only=True,
         hosted_edit_enabled=True,
@@ -3528,7 +4054,7 @@ def build_hosted_performance_summary_action_response(
         "macro_grade": [],
         "structure_grade": [],
     }
-    normalized_filters.update(filters or {})
+    normalized_filters.update(enforce_hosted_talos_performance_filters(filters or {}))
     payload = build_hosted_performance_dashboard(filters=normalized_filters, app=app)
     return {
         "ok": True,
@@ -3539,7 +4065,7 @@ def build_hosted_performance_summary_action_response(
 
 def build_hosted_journal_trades_action_response(*, trade_mode: str, app: Optional[Flask] = None) -> Dict[str, Any]:
     trade_store = get_trade_store(app)
-    normalized_mode = "real" if resolve_trade_mode(trade_mode) in {"real", "talos"} else "simulated"
+    normalized_mode = "talos"
     loaded_trades = load_retained_trade_rows(trade_store, normalized_mode)
     summary = summarize_loaded_trade_rows(loaded_trades)
     trades = [build_trade_row_payload(item) for item in loaded_trades]
@@ -3556,7 +4082,7 @@ def build_hosted_journal_trades_action_response(*, trade_mode: str, app: Optiona
 
 
 def build_hosted_open_trades_action_response(*, trade_mode: str, app: Optional[Flask] = None) -> Dict[str, Any]:
-    management_payload = build_hosted_open_trade_management_payload(app=app)
+    management_payload = build_hosted_open_trade_management_payload(app=app, talos_only=True)
     return {
         "ok": True,
         "action": "open-trades",
@@ -3605,6 +4131,7 @@ def build_hosted_shell_navigation() -> list[Dict[str, str]]:
     route_map = build_delphi_route_map(hosted=True)
     return [
         {"key": "home", "label": "Home", "href": route_map["home"]},
+        {"key": "talos", "label": "Talos", "href": route_map["talos"]},
         {"key": "performance", "label": "Performance", "href": route_map["performance"]},
         {"key": "journal", "label": "Journal", "href": route_map["journal"]},
         {"key": "manage-trades", "label": "Manage Trades", "href": route_map["management"]},
@@ -3616,21 +4143,21 @@ def build_delphi_route_map(*, hosted: bool = False) -> Dict[str, str]:
     if hosted:
         return {
             "home": url_for("hosted_shell_home"),
+            "talos": url_for("hosted_shell_talos"),
             "apollo": url_for("hosted_shell_apollo", autorun=1),
             "management": url_for("hosted_shell_manage_trades"),
             "performance": url_for("hosted_shell_performance"),
-            "journal": url_for("hosted_shell_journal", trade_mode="real"),
-            "journal_real": url_for("hosted_shell_journal", trade_mode="real"),
-            "journal_simulated": url_for("hosted_shell_journal", trade_mode="simulated"),
+            "journal": url_for("hosted_shell_journal", trade_mode="talos"),
+            "journal_real": url_for("hosted_shell_journal", trade_mode="talos"),
+            "journal_simulated": url_for("hosted_shell_journal", trade_mode="talos"),
             "open_trades": url_for("hosted_shell_open_trades"),
-            "notifications": url_for("hosted_notifications_settings_page"),
             "performance_data": url_for("hosted_performance_data"),
-            "text_status": url_for("text_status_api"),
             "logout": url_for("hosted_browser_sign_out"),
         }
 
     return {
         "home": url_for("index"),
+        "talos": url_for("talos_workspace"),
         "apollo": url_for("run_apollo", autorun=1),
         "management": url_for("open_trade_management_page"),
         "performance": url_for("performance_dashboard"),
@@ -3638,9 +4165,7 @@ def build_delphi_route_map(*, hosted: bool = False) -> Dict[str, str]:
         "journal_real": url_for("trade_dashboard", trade_mode="real"),
         "journal_simulated": url_for("trade_dashboard", trade_mode="simulated"),
         "open_trades": url_for("open_trade_management_page"),
-        "notifications": url_for("notifications_settings_page"),
         "performance_data": url_for("performance_dashboard_data"),
-        "text_status": url_for("text_status_api"),
     }
 
 
@@ -3671,7 +4196,7 @@ def get_hosted_device_branch(*, default: str = "desktop") -> str:
 
 
 def build_hosted_login_url(branch: Any, *, next_path: Any = None) -> str:
-    active_branch = resolve_hosted_device_branch(branch)
+    active_branch = "desktop"
     sanitized_next = sanitize_hosted_next_path(next_path)
     default_home = url_for("hosted_shell_home") if has_request_context() else "/hosted"
     if sanitized_next == default_home:
@@ -3691,7 +4216,7 @@ def map_hosted_next_path_to_desktop_path(next_path: Any) -> str:
     if normalized.startswith("/hosted/mobile/performance"):
         return url_for("hosted_shell_performance") if has_request_context() else "/hosted/performance"
     if normalized.startswith("/hosted/mobile/journal"):
-        return url_for("hosted_shell_journal", trade_mode="real") if has_request_context() else "/hosted/journal?trade_mode=real"
+        return url_for("hosted_shell_journal", trade_mode="talos") if has_request_context() else "/hosted/journal?trade_mode=talos"
     if normalized.startswith("/hosted/mobile/trades"):
         return url_for("hosted_shell_manage_trades") if has_request_context() else "/hosted/manage-trades"
     if normalized.startswith("/hosted/mobile/runs"):
@@ -3718,26 +4243,10 @@ def resolve_hosted_mobile_tab(value: Any) -> str:
 
 
 def build_hosted_launch_url(next_path: Any = None, view: Any = None) -> str:
-    sanitized_next = sanitize_hosted_next_path(next_path)
-    default_home = url_for("hosted_shell_home") if has_request_context() else "/hosted"
-    normalized_view = normalize_hosted_device_branch(view)
-    route_params: Dict[str, Any] = {}
-    if sanitized_next != default_home:
-        route_params["next"] = sanitized_next
-    if normalized_view:
-        route_params["view"] = normalized_view
-    if has_request_context():
-        return url_for("hosted_device_launch", **route_params)
-    if not route_params:
-        return "/hosted/launch"
-    encoded = urllib.parse.urlencode(route_params)
-    return f"/hosted/launch?{encoded}"
+    return url_for("hosted_shell_home") if has_request_context() else "/hosted"
 
 
 def build_hosted_branch_destination(branch: Any, *, next_path: Any = None) -> str:
-    active_branch = resolve_hosted_device_branch(branch)
-    if active_branch == "mobile":
-        return map_hosted_next_path_to_mobile_path(next_path)
     return map_hosted_next_path_to_desktop_path(next_path)
 
 
@@ -3748,8 +4257,8 @@ def render_hosted_login_page(
     form_email: str,
     error_message: str,
 ) -> Any:
-    active_branch = resolve_hosted_device_branch(branch)
-    template_name = "hosted_login_mobile.html" if active_branch == "mobile" else "hosted_login.html"
+    active_branch = "desktop"
+    template_name = "hosted_login.html"
     app_identity = build_runtime_app_identity(current_app)
     return render_template(
         template_name,
@@ -3761,8 +4270,8 @@ def render_hosted_login_page(
         error_message=error_message,
         active_branch=active_branch,
         login_action_url=url_for("hosted_branch_login", branch=active_branch),
-        alternate_branch=("mobile" if active_branch == "desktop" else "desktop"),
-        alternate_login_url=build_hosted_login_url("mobile" if active_branch == "desktop" else "desktop", next_path=next_path),
+        alternate_branch="desktop",
+        alternate_login_url=build_hosted_login_url("desktop", next_path=next_path),
     )
 
 
@@ -3970,13 +4479,13 @@ def build_hosted_mobile_shell_context(
     provider_meta = get_market_data_service(app).get_provider_metadata()
     provider_name = str(provider_meta.get("live_provider_name") or provider_meta.get("provider_name") or "Schwab").strip() or "Schwab"
     requires_auth = bool(provider_meta.get("requires_auth"))
-    provider_authenticated = bool(provider_meta.get("authenticated", True))
+    schwab_status = resolve_schwab_connection_status(get_market_data_service(app))
     mobile_next_path = request.full_path if has_request_context() else mobile_routes.get("home", "/hosted/mobile")
     mobile_schwab = {
         "provider_name": provider_name,
         "requires_auth": requires_auth,
-        "connected": (not requires_auth) or provider_authenticated,
-        "status_label": "Connected" if (not requires_auth) or provider_authenticated else "Login required",
+        "connected": schwab_status["connected"],
+        "status_label": schwab_status["status_label"],
         "connect_url": build_hosted_login_url(get_hosted_device_branch(default="mobile"), next_path=mobile_next_path),
     }
     performance_payload: Dict[str, Any] = build_dashboard_payload([], filters=performance_ui_filters)
@@ -4074,9 +4583,8 @@ def build_hosted_header_status_items(
     app: Optional[Flask] = None,
     extra_items: Optional[list[Dict[str, str]]] = None,
 ) -> list[Dict[str, str]]:
-    provider_meta = get_market_data_service(app).get_provider_metadata()
-    requires_auth = bool(provider_meta.get("requires_auth"))
-    schwab_connected = not requires_auth or bool(provider_meta.get("authenticated", True))
+    schwab_status = resolve_schwab_connection_status(get_market_data_service(app))
+    schwab_connected = schwab_status["connected"]
     items = [
         {
             "label": "Hosted session",
@@ -4086,8 +4594,8 @@ def build_hosted_header_status_items(
         },
         {
             "label": "Schwab",
-            "value": "Connected" if schwab_connected else "Login required",
-            "meta": str(provider_meta.get("live_provider_name") or "Unknown Provider"),
+            "value": schwab_status["status_label"],
+            "meta": schwab_status["status_meta"],
             "tone": "good" if schwab_connected else "warning",
         },
     ]
@@ -4245,6 +4753,49 @@ def get_open_trade_manager(app: Optional[Flask] = None) -> OpenTradeManager:
     if getattr(manager, "global_notification_settings_repository", None) is not global_settings_repository:
         manager.global_notification_settings_repository = global_settings_repository
     return manager
+
+
+def get_talos_engine(app: Optional[Flask] = None) -> TalosEngine:
+    container = _resolve_flask_container(app)
+    engine = container.extensions.get("talos_engine")
+    if engine is None:
+        engine = TalosEngine(
+            trade_store=get_trade_store(container),
+            apollo_service=get_apollo_service(container),
+            open_trade_manager=get_open_trade_manager(container),
+            execution_auth_service=get_schwab_trading_auth_service(container),
+            order_service=TalosExecutionService(
+                execution_auth_service=get_schwab_trading_auth_service(container),
+                config=get_runtime_app_config(container),
+            ),
+            apollo_snapshot_repository=get_apollo_snapshot_repository(container),
+            config=get_runtime_app_config(container),
+            scheduler=get_service_bundle(container).runtime_scheduler,
+            state_path=Path(container.instance_path) / "talos_state.json",
+        )
+        engine.initialize()
+        container.extensions["talos_engine"] = engine
+    return engine
+
+
+def get_schwab_trading_auth_service(app: Optional[Flask] = None) -> SchwabTradingAuthService:
+    container = _resolve_flask_container(app)
+    service = container.extensions.get("schwab_trading_auth_service")
+    if service is None:
+        runtime_config = get_runtime_app_config(container)
+        service = SchwabTradingAuthService(
+            config=runtime_config,
+            token_store=JsonFileTokenRepository(runtime_config.schwab_trading_token_path),
+        )
+        container.extensions["schwab_trading_auth_service"] = service
+    return service
+
+
+def resolve_post_trading_oauth_redirect_target(app: Optional[Flask] = None) -> str:
+    container = _resolve_flask_container(app)
+    if container.config.get("RUNTIME_TARGET") == "hosted":
+        return url_for("hosted_shell_talos")
+    return url_for("talos_workspace")
 
 
 def get_kairos_live_service(app: Optional[Flask] = None) -> KairosService:
@@ -4463,6 +5014,14 @@ def save_kairos_snapshot(kairos_result: Optional[Dict[str, Any]], app: Optional[
 
 def execute_hosted_apollo_live_run(*, app: Optional[Flask] = None) -> Dict[str, Any]:
     container = _resolve_flask_container(app)
+    market_data_service = get_market_data_service(container)
+    provider_meta = market_data_service.get_provider_metadata()
+    if provider_meta.get("requires_auth") and not resolve_schwab_connection_status(market_data_service)["connected"]:
+        raise MarketDataAuthenticationError("Schwab authentication required")
+
+    market_data_service.get_fresh_latest_snapshot("^GSPC", query_type="hosted_apollo_preflight_spx")
+    market_data_service.get_fresh_latest_snapshot("^VIX", query_type="hosted_apollo_preflight_vix")
+
     result = prepare_hosted_apollo_payload(execute_apollo_precheck(
         get_apollo_service(container),
         trigger_source="hosted live execution",
@@ -4540,9 +5099,35 @@ def build_empty_hosted_apollo_payload() -> Dict[str, Any]:
     })
 
 
+def build_hosted_apollo_error_payload(error_message: str) -> Dict[str, Any]:
+    payload = build_empty_hosted_apollo_payload()
+    normalized_message = str(error_message or "").strip() or "Schwab option chain unavailable"
+    status_label = "Schwab option chain unavailable"
+    if "token expired" in normalized_message.lower():
+        status_label = "Schwab token expired"
+    elif "authentication required" in normalized_message.lower():
+        status_label = "Schwab authentication required"
+
+    payload.update({
+        "status": "Blocked",
+        "status_class": "blocked",
+        "run_timestamp": format_apollo_datetime(datetime.now(CHICAGO_TZ)),
+        "execution_source_label": "Hosted live execution",
+        "live_data_provider": "Schwab",
+        "provider_name": "Schwab",
+        "option_chain_status": status_label,
+        "option_chain_failure_label": status_label,
+        "option_chain_message": normalized_message,
+        "trade_candidates_message": normalized_message,
+        "trade_candidates_items": [],
+        "reasons": [normalized_message],
+    })
+    return prepare_hosted_apollo_payload(payload)
+
+
 def prepare_hosted_apollo_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     apollo_payload = dict(payload or {})
-    provider_display = str(apollo_payload.get("live_data_provider") or apollo_payload.get("provider_name") or "Schwab")
+    provider_display = "Schwab"
     apollo_payload["provider_name"] = provider_display
     status_text = str(apollo_payload.get("status") or "Blocked").strip() or "Blocked"
     status_key = str(apollo_payload.get("status_class") or status_text).strip().lower().replace(" ", "-")
@@ -5067,10 +5652,9 @@ def build_trade_page_context(
     import_preview: Optional[Dict[str, Any]] = None,
     import_journal_name: str = JOURNAL_NAME_DEFAULT,
     available_trade_modes: Optional[list[str] | tuple[str, ...]] = None,
+    filter_groups: Optional[Dict[str, list[str]]] = None,
 ) -> Dict[str, Any]:
     normalized_mode = resolve_trade_mode(trade_mode)
-    if normalized_mode == "talos":
-        normalized_mode = "real"
     loaded_trades = load_retained_trade_rows(store, normalized_mode)
     trades = [build_trade_row_payload(item) for item in loaded_trades]
     summary = summarize_loaded_trade_rows(loaded_trades)
@@ -5103,7 +5687,7 @@ def build_trade_page_context(
             for key, label in TRADE_MODE_LABELS.items()
             if key in (available_trade_modes or PUBLIC_TRADE_MODES)
         ],
-        "filter_groups": TRADE_FILTER_GROUPS,
+        "filter_groups": filter_groups or TRADE_FILTER_GROUPS,
         "system_name_options": list(TRADE_SYSTEM_OPTIONS),
         "journal_name_options": journal_name_options,
         "candidate_profiles": list(TRADE_PROFILE_OPTIONS),
@@ -5212,11 +5796,12 @@ def _build_hosted_performance_dashboard_uncached(*, filters: Dict[str, list[str]
         builder=load_records,
         app=app,
     )
-    return build_dashboard_payload(records, filters=filters)
+    talos_records = [record for record in records if resolve_trade_system_name(record) == "Talos"]
+    return build_dashboard_payload(talos_records, filters=enforce_hosted_talos_performance_filters(filters))
 
 
-def build_hosted_open_trade_management_payload(*, app: Optional[Flask] = None) -> Dict[str, Any]:
-    return _get_cached_hosted_payload(
+def build_hosted_open_trade_management_payload(*, app: Optional[Flask] = None, talos_only: bool = False) -> Dict[str, Any]:
+    payload = _get_cached_hosted_payload(
         "hosted:open-trades",
         ttl_seconds=HOSTED_OPEN_TRADES_CACHE_SECONDS,
         builder=lambda: get_open_trade_manager(app).evaluate_open_trades(
@@ -5225,6 +5810,22 @@ def build_hosted_open_trade_management_payload(*, app: Optional[Flask] = None) -
         ),
         app=app,
     )
+    if not talos_only:
+        return payload
+    return build_talos_only_management_payload(payload)
+
+
+def build_talos_only_management_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    filtered_payload = dict(payload or {})
+    records = [
+        dict(record)
+        for record in (filtered_payload.get("records") or [])
+        if resolve_trade_system_name(record) == "Talos"
+    ]
+    filtered_payload["records"] = records
+    filtered_payload["status_counts"] = build_open_trade_status_counts(records)
+    filtered_payload["open_trade_count"] = len(records)
+    return filtered_payload
 
 
 def build_hosted_apollo_live_payload(*, app: Optional[Flask] = None, force_refresh: bool = False) -> Dict[str, Any]:
@@ -5273,6 +5874,7 @@ def prepare_trade_form_values(values: Dict[str, Any]) -> Dict[str, str]:
     for field in TRADE_FORM_FIELDS:
         prepared.setdefault(field, "")
     prepared["system_name"] = normalize_system_name(prepared.get("system_name"))
+    prepared["journal_name"] = normalize_journal_name(prepared.get("journal_name"))
     prepared["candidate_profile"] = normalize_candidate_profile(prepared.get("candidate_profile"))
     expected_move_metadata = resolve_trade_expected_move(prepared)
     prepared["expected_move"] = (
@@ -5416,8 +6018,8 @@ def build_trade_row_payload(trade: Dict[str, Any]) -> Dict[str, Any]:
         "notes_entry": trade.get("notes_entry") or "",
         "notes_exit": trade.get("notes_exit") or "",
         "trade_mode": trade.get("trade_mode") or "real",
-        "journal_name": trade.get("journal_name") or JOURNAL_NAME_DEFAULT,
-        "journal_name_raw": str(trade.get("journal_name") or JOURNAL_NAME_DEFAULT).lower(),
+        "journal_name": normalize_journal_name(trade.get("journal_name")),
+        "journal_name_raw": normalize_journal_name(trade.get("journal_name")).lower(),
         "close_reason": trade.get("close_reason") or "",
     }
 
@@ -5839,6 +6441,8 @@ def build_apollo_result_payload(apollo_data: Dict[str, Any], trigger_source: Opt
     for index, item in enumerate(trade_candidates.get("candidates", [])):
         if not isinstance(item, dict):
             continue
+        if str(item.get("mode_key") or "").strip().lower() != "fortress":
+            continue
         probability_labels = build_candidate_probability_labels(item.get("short_delta"), item.get("long_delta"))
         prefill_fields = build_apollo_candidate_prefill_fields(
             item,
@@ -5957,13 +6561,14 @@ def build_apollo_result_payload(apollo_data: Dict[str, Any], trigger_source: Opt
         "Minor": "neutral",
         "Major": "poor",
     }.get(macro_grade, "not-available")
-    valid_trade_candidate_count = int(
-        trade_candidates.get("valid_mode_count")
-        or sum(1 for item in trade_candidate_items if item.get("available"))
-    )
+    visible_trade_candidate_count = len(trade_candidate_items)
+    valid_trade_candidate_count = sum(1 for item in trade_candidate_items if item.get("available"))
     trade_candidates_outcome_category = "ready" if valid_trade_candidate_count else ""
     trade_candidates_outcome_label = "Ready" if valid_trade_candidate_count else ""
-    if option_chain.get("success", False) and not valid_trade_candidate_count:
+    if option_chain.get("success", False) and visible_trade_candidate_count and not valid_trade_candidate_count:
+        trade_candidates_outcome_category = "no-candidates"
+        trade_candidates_outcome_label = "No candidates"
+    elif option_chain.get("success", False) and not visible_trade_candidate_count:
         trade_candidates_outcome_category = "no-candidates"
         trade_candidates_outcome_label = "No candidates"
 
@@ -6088,11 +6693,11 @@ def build_apollo_result_payload(apollo_data: Dict[str, Any], trigger_source: Opt
         "trade_candidates_status": trade_candidates.get("status", "Stand Aside"),
         "trade_candidates_status_class": trade_candidates.get("status_class", "not-available"),
         "trade_candidates_message": trade_candidates.get("message", "No trade candidates were produced."),
-        "trade_candidates_count": trade_candidates.get("candidate_count", 0),
+        "trade_candidates_count": visible_trade_candidate_count,
         "trade_candidates_valid_count": valid_trade_candidate_count,
         "trade_candidates_outcome_category": trade_candidates_outcome_category,
         "trade_candidates_outcome_label": trade_candidates_outcome_label,
-        "trade_candidates_count_label": trade_candidates.get("count_label") or format_candidate_count_label(trade_candidates.get("candidate_count", 0)),
+        "trade_candidates_count_label": format_candidate_count_label(visible_trade_candidate_count),
         "trade_candidates_underlying_price": format_value(trade_candidates.get("underlying_price")),
         "trade_candidates_expected_move": format_value(trade_candidates.get("expected_move")),
         "trade_candidates_expected_move_range": trade_candidates.get("expected_move_range", "—"),

@@ -63,6 +63,31 @@ td {
 .management-row-talos {
     background: rgba(241, 243, 246, 0.88);
 }
+.talos-trade-row-real {
+    background: rgba(255, 255, 255, 0.96);
+}
+.talos-trade-row-simulated {
+    background: rgba(225, 239, 255, 0.68);
+}
+.talos-system-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 8px;
+    border-radius: 999px;
+    border: 1px solid rgba(23, 48, 74, 0.12);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+}
+.talos-system-pill-real {
+    background: rgba(255, 255, 255, 0.96);
+    color: #17304a;
+}
+.talos-system-pill-simulated {
+    background: rgba(216, 234, 255, 0.96);
+    color: #184d8b;
+    border-color: rgba(89, 131, 196, 0.24);
+}
 .talos-engine-header {
     align-items: start;
 }
@@ -257,6 +282,415 @@ td {
 .talos-band-list {
     display: grid;
     gap: 8px;
+}
+.talos-master-mode-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+}
+.talos-mode-tile {
+    display: grid;
+    gap: 8px;
+    text-align: left;
+    padding: 18px;
+    border-radius: 18px;
+    border: 2px solid #b72e2e;
+    background: linear-gradient(180deg, #fff3f3 0%, #ffd8d8 100%);
+    color: var(--text);
+    cursor: pointer;
+    transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+.talos-mode-tile:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 28px rgba(18, 49, 78, 0.08);
+}
+.talos-mode-tile:disabled {
+    cursor: not-allowed;
+    opacity: 0.72;
+}
+.talos-mode-tile-selected {
+    border-color: #20744a;
+    background: linear-gradient(180deg, #eefdf4 0%, #c8f1d7 100%);
+    box-shadow: 0 0 0 2px rgba(32, 116, 74, 0.18);
+}
+.talos-mode-tile-unselected {
+    border-color: #b72e2e;
+    background: linear-gradient(180deg, #fff3f3 0%, #ffd8d8 100%);
+}
+.talos-mode-tile-label {
+    font-size: 1.05rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+}
+.talos-mode-tile-copy {
+    color: var(--muted);
+    font-size: 0.88rem;
+}
+.talos-master-mode-banner {
+    margin-top: 14px;
+}
+.talos-master-mode-banner-inactive {
+    border-left: 4px solid #7e8c9d;
+}
+.talos-master-mode-banner-simulated {
+    border-left: 4px solid var(--accent);
+}
+.talos-master-mode-banner-active-locked {
+    border-left: 4px solid #c78b2b;
+}
+.talos-advanced-details {
+    margin-top: 14px;
+}
+.talos-advanced-grid {
+    margin-top: 12px;
+}
+.talos-action-row {
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.talos-action-row form {
+    margin: 0;
+}
+.talos-account-actions {
+    margin-top: 14px;
+}
+.talos-manual-account-form {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.talos-manual-account-form .field-group {
+    min-width: 220px;
+    margin: 0;
+}
+.talos-auth-banner {
+    margin-top: 14px;
+}
+.talos-health-panel,
+.talos-timing-panel,
+.talos-risk-panel-compact,
+.talos-decision-panel,
+.talos-positions-panel {
+    padding-top: 18px;
+}
+.talos-timing-card {
+    display: grid;
+    grid-template-columns: minmax(180px, 1.3fr) minmax(110px, 0.6fr) 1.4fr;
+    gap: 14px;
+    align-items: center;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: #ffffff;
+}
+.talos-timing-card-info {
+    background: linear-gradient(180deg, #f5f9fd 0%, #eef5fb 100%);
+}
+.talos-timing-card-success {
+    background: linear-gradient(180deg, #f2fbf5 0%, #e9f7ee 100%);
+}
+.talos-timing-card-warning {
+    background: linear-gradient(180deg, #fff9ee 0%, #fff2d9 100%);
+}
+.talos-timing-card-muted {
+    background: linear-gradient(180deg, #f5f5f5 0%, #ececec 100%);
+}
+.talos-timing-value {
+    margin: 4px 0 0;
+    font-size: 1.25rem;
+    font-weight: 800;
+}
+.talos-timing-detail {
+    color: var(--muted);
+    font-size: 0.88rem;
+}
+.talos-health-strip,
+.talos-risk-strip,
+.talos-gate-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+}
+.talos-health-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: #ffffff;
+}
+.talos-health-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+}
+.talos-health-dot-ready {
+    background: #2a8f55;
+}
+.talos-health-dot-warn {
+    background: #d1a036;
+}
+.talos-health-dot-down {
+    background: #c55353;
+}
+.talos-health-label {
+    color: var(--muted);
+    font-size: 0.82rem;
+}
+.talos-health-value {
+    margin-left: auto;
+    font-size: 0.88rem;
+}
+.talos-operator-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 14px;
+}
+.talos-operator-grid-top {
+    margin-bottom: 14px;
+}
+.talos-operator-note,
+.talos-decision-explainer,
+.talos-operator-reason {
+    margin-top: 12px;
+}
+.talos-gate-ladder {
+    display: grid;
+    gap: 12px;
+    margin-top: 16px;
+}
+.talos-gate-ladder-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 16px 18px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+}
+.talos-gate-state {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 92px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.talos-gate-state-waiting {
+    background: #eef3f8;
+    border-color: #cad7e4;
+    color: #425569;
+}
+.talos-gate-state-armed {
+    background: #fff5dd;
+    border-color: #f0c56a;
+    color: #8b5d00;
+}
+.talos-gate-state-triggered {
+    background: #fff0d7;
+    border-color: #e89a3d;
+    color: #9a4f00;
+}
+.talos-gate-state-completed {
+    background: #e8f7ed;
+    border-color: #73bd8f;
+    color: #23633f;
+}
+.talos-gate-state-unavailable {
+    background: #f8ecec;
+    border-color: #d58e8e;
+    color: #8f3d3d;
+}
+.talos-system-checks-row {
+    align-items: flex-end;
+}
+.talos-preview-shell {
+    margin-top: 14px;
+}
+.talos-trade-card {
+    display: grid;
+    gap: 14px;
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+}
+.talos-trade-card-primary {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: end;
+}
+.talos-trade-card-headline h3 {
+    margin: 4px 0 0;
+    font-size: 1.5rem;
+}
+.talos-trade-card-spread-value {
+    margin: 4px 0 0;
+    font-size: 1.05rem;
+    font-weight: 700;
+}
+.talos-trade-card-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+}
+.talos-trade-card-reason {
+    margin-top: 0;
+}
+.talos-monitor-panel {
+    border-color: #b9cbdd;
+    background: linear-gradient(180deg, #edf4fb 0%, #dfeaf6 100%);
+}
+.talos-monitor-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+}
+.talos-monitor-action-card {
+    background: rgba(255, 255, 255, 0.92);
+}
+.talos-monitor-action {
+    font-size: 1.35rem;
+    font-weight: 800;
+}
+.talos-monitor-action-monitoring {
+    color: #2a8f55;
+}
+.talos-monitor-action-watch {
+    color: #b27c12;
+}
+.talos-monitor-action-exit {
+    color: #b13a3a;
+}
+.talos-monitor-action-candidate {
+    color: #2d6cdf;
+}
+.talos-gate-table-wrap {
+    margin-top: 12px;
+}
+.talos-gate-table td,
+.talos-gate-table th {
+    vertical-align: middle;
+}
+.talos-open-positions-wrap {
+    margin-top: 8px;
+}
+.talos-open-positions-table {
+    font-size: 0.98rem;
+}
+.talos-open-position-row td {
+    background: rgba(255, 255, 255, 0.96);
+}
+.talos-open-position-row-healthy td {
+    border-top: 1px solid #dcecdf;
+}
+.talos-open-position-row-watch td {
+    border-top: 1px solid #f2dfad;
+    background: #fffaf0;
+}
+.talos-open-position-row-exit td {
+    border-top: 1px solid #efc6c6;
+    background: #fff5f5;
+}
+.talos-status-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 700;
+}
+.talos-status-pill-healthy {
+    color: #23633f;
+    background: #e8f7ed;
+}
+.talos-status-pill-watch {
+    color: #8b5d00;
+    background: #fff4da;
+}
+.talos-status-pill-exit {
+    color: #8f2d2d;
+    background: #fde9e9;
+}
+.talos-badge-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 12px;
+}
+.talos-ui-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+.talos-ui-badge-success {
+    color: #23633f;
+    background: #e8f7ed;
+}
+.talos-ui-badge-info {
+    color: #1f4f7d;
+    background: #e7f1fb;
+}
+.talos-ui-badge-warning {
+    color: #8b5d00;
+    background: #fff4da;
+}
+.talos-ui-badge-danger {
+    color: #8f2d2d;
+    background: #fde9e9;
+}
+.talos-ui-badge-muted {
+    color: #536273;
+    background: #edf1f5;
+}
+.talos-system-checks-shell {
+    margin-top: 0;
+}
+.talos-real-check-form.talos-control-disabled {
+    opacity: 0.58;
+}
+.talos-real-check-form.talos-control-disabled button,
+.talos-real-check-form.talos-control-disabled input,
+.talos-real-check-form.talos-control-disabled select {
+    filter: saturate(0.6);
+}
+@media (max-width: 900px) {
+    .talos-master-mode-grid {
+        grid-template-columns: 1fr;
+    }
+    .talos-manual-account-form {
+        display: grid;
+        width: 100%;
+    }
+    .talos-gate-ladder-item {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    .talos-gate-state {
+        width: fit-content;
+    }
+    .talos-trade-card-primary {
+        display: grid;
+    }
+    .talos-timing-card {
+        grid-template-columns: 1fr;
+    }
 }
 .talos-legend-item,
 .talos-band-item {

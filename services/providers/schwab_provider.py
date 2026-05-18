@@ -432,6 +432,71 @@ class SchwabProvider(BaseMarketDataProvider):
             raise ProviderError(f"Schwab rejected the option-chain request: {diagnostics['error_detail']}")
         raise ProviderError("Schwab option-chain lookup failed before a request could be completed.")
 
+    def get_account_summary(self) -> Dict[str, Any]:
+        """Return the primary authenticated Schwab account summary for sizing and diagnostics."""
+        account_numbers_endpoint = self._resolve_trader_endpoint("accounts/accountNumbers")
+        account_numbers_response = self._authorized_get(account_numbers_endpoint, params={})
+        if account_numbers_response.status_code >= 400:
+            raise ProviderError(
+                f"Unable to retrieve Schwab account numbers right now ({account_numbers_response.status_code}).",
+                is_transient=account_numbers_response.status_code >= 500,
+            )
+
+        account_numbers_payload = account_numbers_response.json()
+        account_entries = account_numbers_payload if isinstance(account_numbers_payload, list) else []
+        if not account_entries:
+            raise ProviderError("Schwab returned no linked accounts for this session.")
+
+        primary_account = account_entries[0] if isinstance(account_entries[0], dict) else {}
+        account_hash = str(primary_account.get("hashValue") or primary_account.get("accountHash") or "").strip()
+        if not account_hash:
+            raise ProviderError("Schwab returned an account entry without a usable account hash.")
+
+        account_detail_endpoint = self._resolve_trader_endpoint(f"accounts/{account_hash}")
+        account_detail_response = self._authorized_get(account_detail_endpoint, params={"fields": "positions"})
+        if account_detail_response.status_code >= 400:
+            raise ProviderError(
+                f"Unable to retrieve Schwab account balances right now ({account_detail_response.status_code}).",
+                is_transient=account_detail_response.status_code >= 500,
+            )
+
+        account_payload = account_detail_response.json()
+        securities_account = (account_payload or {}).get("securitiesAccount") if isinstance(account_payload, dict) else None
+        if not isinstance(securities_account, dict):
+            raise ProviderError("Schwab returned an unexpected account payload.")
+
+        balances = securities_account.get("currentBalances") or securities_account.get("initialBalances") or {}
+        liquidation_value = self._coerce_float(
+            balances.get("liquidationValue")
+            or balances.get("netLiquidationValue")
+            or balances.get("equity")
+            or balances.get("cashBalance")
+        )
+        buying_power = self._coerce_float(
+            balances.get("buyingPower")
+            or balances.get("dayTradingBuyingPower")
+            or balances.get("cashAvailableForTrading")
+        )
+        timestamp = self._parse_timestamp(
+            securities_account.get("roundTrips")
+            or balances.get("timestamp")
+            or balances.get("asOfTime")
+            or balances.get("lastUpdated")
+        ) or datetime.now(self.display_timezone)
+
+        return {
+            "account_number_masked": str(primary_account.get("accountNumber") or "").strip(),
+            "account_hash": account_hash,
+            "account_type": str(securities_account.get("type") or securities_account.get("accountType") or "Schwab").strip(),
+            "liquidation_value": liquidation_value,
+            "buying_power": buying_power,
+            "raw_balances": balances,
+            "positions": securities_account.get("positions") or [],
+            "as_of": timestamp.isoformat(),
+            "as_of_display": timestamp.strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+            "authenticated": True,
+        }
+
     def debug_option_chain_request(self, symbol: str, target_date: date, minimal_only: bool = True) -> Dict[str, Any]:
         """Run a raw Schwab option-chain request for debugging and return diagnostics."""
         endpoint = f"{self.config.schwab_base_url}/chains"
@@ -518,11 +583,22 @@ class SchwabProvider(BaseMarketDataProvider):
             "fromDate": iso_expiration,
             "toDate": iso_expiration,
         }
+
         if include_underlying_quote is not None:
             params["includeUnderlyingQuote"] = str(include_underlying_quote).lower()
         if strike_count is not None:
             params["strikeCount"] = str(strike_count)
+        if underlying_price is not None:
+            params["underlyingPrice"] = str(underlying_price)
+
         return self._clean_option_chain_params(params)
+
+    def _resolve_trader_endpoint(self, suffix: str) -> str:
+        base_url = str(self.config.schwab_base_url or "").strip().rstrip("/")
+        if "/marketdata/" in base_url:
+            root = base_url.split("/marketdata/", 1)[0]
+            return f"{root}/trader/v1/{suffix.lstrip('/')}"
+        return f"https://api.schwabapi.com/trader/v1/{suffix.lstrip('/')}"
 
     def _build_option_chain_attempts(self, symbol: str, expiration_date: date) -> List[tuple[str, Dict[str, Any]]]:
         """Return the fallback request ladder for the Schwab chain endpoint."""
@@ -697,12 +773,29 @@ class SchwabProvider(BaseMarketDataProvider):
             timeout=30,
         )
         if response.status_code == 401:
-            self.auth_service.clear_tokens()
+            if self._is_trader_account_endpoint(endpoint):
+                account_scope_error = ProviderAuthRequiredError("Schwab account access unavailable for this session.")
+                self._record_backoff(request_scope_key, seconds=self.AUTH_BACKOFF_SECONDS, error=account_scope_error)
+                self._record_backoff(request_signature, seconds=self.AUTH_BACKOFF_SECONDS, error=account_scope_error)
+                self._log_once(
+                    f"account-unauthorized:{request_scope_key}",
+                    logging.WARNING,
+                    "Schwab trader account request remained unauthorized after refresh | endpoint=%s | params=%s",
+                    endpoint,
+                    params,
+                )
+                raise account_scope_error
+            self.auth_service.mark_reauthentication_required("Schwab authentication expired. Please log in again.")
             reauth_error = ProviderReauthenticationRequiredError("Schwab authentication expired. Please log in again.")
             self._record_backoff(request_scope_key, seconds=self.AUTH_BACKOFF_SECONDS, error=reauth_error)
             self._record_backoff(request_signature, seconds=self.AUTH_BACKOFF_SECONDS, error=reauth_error)
             raise reauth_error
         return response
+
+    @staticmethod
+    def _is_trader_account_endpoint(endpoint: str) -> bool:
+        normalized = str(endpoint or "").strip().lower()
+        return "/trader/v1/accounts/" in normalized
 
     def _request_signature(self, endpoint: str, params: Dict[str, Any]) -> str:
         return f"{self._request_scope_key(endpoint)}:{json.dumps(params, sort_keys=True, default=str)}"

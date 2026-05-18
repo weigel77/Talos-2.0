@@ -101,9 +101,12 @@ class LocalRuntimeServiceComposer:
         )
         pushover_service = PushoverService(config=self.config)
         notification_delivery = PushoverNotificationDelivery(pushover_service)
+        apollo_option_chain_provider = market_data_service.live_provider
+        if getattr(apollo_option_chain_provider, "provider_key", "") != "schwab":
+            apollo_option_chain_provider = None
         apollo_options_chain_service = OptionsChainService(
             self.config,
-            provider=market_data_service.live_provider,
+            provider=apollo_option_chain_provider,
             provider_composer=self.provider_composer,
             auth_composer=self.auth_composer,
         )
@@ -127,13 +130,7 @@ class LocalRuntimeServiceComposer:
             scheduler=runtime_scheduler,
         )
         open_trade_manager.initialize()
-        runtime_components = [
-            RuntimeComponent(
-                name="open_trade_manager",
-                startup=open_trade_manager.start_background_monitoring,
-                shutdown=open_trade_manager.shutdown,
-            ),
-        ]
+        runtime_components = []
         return RuntimeServiceBundle(
             host_infrastructure=self.host_infrastructure,
             market_data_service=market_data_service,

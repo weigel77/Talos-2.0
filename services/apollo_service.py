@@ -6,6 +6,7 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
 from threading import Lock
+from time import perf_counter
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
@@ -17,10 +18,13 @@ from .market_calendar_service import MarketCalendarService
 from .macro_service import MacroService
 from .market_data import MarketDataError, MarketDataService
 from .options_chain_service import OptionsChainService
+from .runtime_metrics_service import get_runtime_metrics_service
 
 
 class ApolloService:
     """Run the staged Apollo pre-check workflow."""
+
+    PRECHECK_CACHE_TTL_SECONDS = 20
 
     def __init__(
         self,
@@ -38,13 +42,40 @@ class ApolloService:
         self.options_chain_service = options_chain_service or OptionsChainService(self.config, provider=self._resolve_option_chain_provider())
         self.candidate_service = ApolloCandidateService(self.config)
         self.display_timezone = ZoneInfo(self.config.app_timezone)
+        self._precheck_cache_ttl_seconds = max(int(self.config.talos_candidate_cache_ttl_seconds or self.PRECHECK_CACHE_TTL_SECONDS), 1)
         self._management_context_cache: Dict[str, Any] | None = None
         self._management_context_cache_expires_at: datetime | None = None
         self._management_context_cache_lock = Lock()
+        self._precheck_cache: Dict[str, Any] | None = None
+        self._precheck_cache_expires_at: datetime | None = None
+        self._precheck_cache_lock = Lock()
 
     def run_precheck(self, *, force_refresh: bool = False, caller_source: str = "apollo-precheck") -> Dict[str, Any]:
         """Execute the first-stage Apollo workflow."""
+        started = perf_counter()
+        metrics = get_runtime_metrics_service()
+        cache_hit = False
         checked_at = datetime.now(self.display_timezone)
+        if not force_refresh:
+            with self._precheck_cache_lock:
+                if self._precheck_cache is not None and self._precheck_cache_expires_at is not None and checked_at <= self._precheck_cache_expires_at:
+                    cache_hit = True
+                    result = copy.deepcopy(self._precheck_cache)
+                    result.setdefault("cache_diagnostics", {})
+                    result["cache_diagnostics"].update(
+                        {
+                            "precheck_cache": "hit",
+                            "precheck_cache_expires_at": self._precheck_cache_expires_at.isoformat(),
+                            "precheck_cache_ttl_seconds": self._precheck_cache_ttl_seconds,
+                        }
+                    )
+                    metrics.record(
+                        "Apollo precheck",
+                        (perf_counter() - started) * 1000.0,
+                        cache_hit=True,
+                        detail=str(caller_source or "apollo-precheck"),
+                    )
+                    return result
         reasons: List[str] = []
         calendar_context = self.market_calendar_service.get_next_market_day_context(checked_at)
 
@@ -161,7 +192,7 @@ class ApolloService:
         else:
             reasons.append("Apollo did not find a qualifying Gate 3 trade candidate.")
 
-        return {
+        result = {
             "title": "Apollo Gate 1 -- SPX Structure",
             "provider_name": provider_name,
             "spx": self._build_market_item("SPX", spx_data),
@@ -178,7 +209,22 @@ class ApolloService:
             "local_datetime": checked_at,
             "apollo_status": apollo_status,
             "reasons": reasons,
+            "cache_diagnostics": {
+                "precheck_cache": "miss",
+                "precheck_cache_ttl_seconds": self._precheck_cache_ttl_seconds,
+            },
         }
+        with self._precheck_cache_lock:
+            self._precheck_cache = copy.deepcopy(result)
+            self._precheck_cache_expires_at = checked_at + timedelta(seconds=self._precheck_cache_ttl_seconds)
+        result["cache_diagnostics"]["precheck_cache_expires_at"] = self._precheck_cache_expires_at.isoformat()
+        metrics.record(
+            "Apollo precheck",
+            (perf_counter() - started) * 1000.0,
+            cache_hit=cache_hit,
+            detail=str(caller_source or "apollo-precheck"),
+        )
+        return result
 
     def build_management_context(self, *, caller_source: str = "apollo-management-context") -> Dict[str, Any]:
         if self.config.runtime_target == "local":

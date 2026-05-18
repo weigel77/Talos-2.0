@@ -23,7 +23,8 @@ DEFAULT_SYSTEM_NAME = "Apollo"
 UNKNOWN_SYSTEM_NAME = "Other"
 DEFAULT_CANDIDATE_PROFILE = "Legacy"
 CHICAGO_TZ = ZoneInfo("America/Chicago")
-JOURNAL_NAME_DEFAULT = "Apollo Main"
+LEGACY_JOURNAL_NAME_DEFAULT = "Apollo Main"
+JOURNAL_NAME_DEFAULT = "Shared Supabase Journal"
 DISTANCE_SOURCE_ORIGINAL = "original"
 DISTANCE_SOURCE_DERIVED = "derived"
 DISTANCE_SOURCE_ESTIMATED = "estimated_fallback"
@@ -167,7 +168,7 @@ CREATE TABLE IF NOT EXISTS trades (
     updated_at TEXT NOT NULL,
     trade_mode TEXT NOT NULL CHECK (trade_mode IN ('real', 'simulated', 'talos')),
     system_name TEXT NOT NULL,
-    journal_name TEXT NOT NULL DEFAULT 'Apollo Main',
+    journal_name TEXT NOT NULL DEFAULT 'Shared Supabase Journal',
     system_version TEXT,
     candidate_profile TEXT,
     status TEXT NOT NULL CHECK (status IN ('open', 'closed', 'expired', 'cancelled')),
@@ -332,7 +333,7 @@ class TradeStore:
             connection.execute("ALTER TABLE trades ADD COLUMN trade_number INTEGER")
         if "journal_name" not in columns:
             connection.execute(
-                "ALTER TABLE trades ADD COLUMN journal_name TEXT NOT NULL DEFAULT 'Apollo Main'"
+                "ALTER TABLE trades ADD COLUMN journal_name TEXT NOT NULL DEFAULT 'Shared Supabase Journal'"
             )
         if "distance_source" not in columns:
             connection.execute("ALTER TABLE trades ADD COLUMN distance_source TEXT")
@@ -1401,6 +1402,15 @@ def normalize_system_name(value: Any) -> str:
     if "apollo" in lowered:
         return "Apollo"
     return DEFAULT_SYSTEM_NAME
+
+
+def normalize_journal_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return JOURNAL_NAME_DEFAULT
+    if text.lower() in {LEGACY_JOURNAL_NAME_DEFAULT.lower(), JOURNAL_NAME_DEFAULT.lower()}:
+        return JOURNAL_NAME_DEFAULT
+    return text
 
 
 def _trade_marker_fields(trade: Dict[str, Any]) -> tuple[str, ...]:

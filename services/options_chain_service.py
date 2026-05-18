@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 from datetime import date, datetime, timedelta
+from time import perf_counter
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,7 @@ from .schwab_auth_service import SchwabAuthService
 from .market_calendar_service import MarketCalendarService
 from .providers.base_provider import ProviderError
 from .providers.schwab_provider import SchwabProvider
+from .runtime_metrics_service import get_runtime_metrics_service
 
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class OptionsChainService:
         self.provider_composer = provider_composer or LocalProviderComposer(self.config, self.auth_composer)
         self.market_calendar_service = MarketCalendarService(self.config)
         self.display_timezone = ZoneInfo(self.config.app_timezone)
+        self._summary_cache_ttl_seconds = max(int(self.config.apollo_option_chain_cache_ttl_seconds or self.SUMMARY_CACHE_TTL_SECONDS), 1)
         self._summary_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._normalization_log_cache: Dict[tuple[str, str, str, str], datetime] = {}
 
@@ -57,6 +60,8 @@ class OptionsChainService:
         log_normalization: bool = True,
     ) -> Dict[str, Any]:
         """Return a compact normalized next-market-day SPX option-chain summary."""
+        started = perf_counter()
+        metrics = get_runtime_metrics_service()
         provider = None
         requested_expiration = expiration_date
         resolved_expiration, normalization_reason = self._normalize_requested_expiration_date(expiration_date)
@@ -64,6 +69,19 @@ class OptionsChainService:
         cache_key = ("spx", resolved_expiration.isoformat())
         cached_summary = self._get_cached_summary(cache_key)
         if cached_summary is not None:
+            cached_summary.setdefault("cache_diagnostics", {})
+            cached_summary["cache_diagnostics"].update(
+                {
+                    "option_chain_cache": "hit",
+                    "option_chain_cache_ttl_seconds": self._summary_cache_ttl_seconds,
+                }
+            )
+            metrics.record(
+                "Apollo option-chain refresh",
+                (perf_counter() - started) * 1000.0,
+                cache_hit=True,
+                detail=f"{resolved_caller_context}|{resolved_expiration.isoformat()}",
+            )
             return cached_summary
         try:
             if normalization_reason and log_normalization:
@@ -116,6 +134,7 @@ class OptionsChainService:
                     "calls": [],
                     "preview_rows": [],
                     "request_diagnostics": request_diagnostics,
+                    "cache_diagnostics": {"option_chain_cache": "miss", "option_chain_cache_ttl_seconds": self._summary_cache_ttl_seconds},
                     "message": "Schwab returned a response, but no usable SPX option contracts were available for the requested expiration.",
                 }
                 self._store_cached_summary(cache_key, summary)
@@ -145,9 +164,16 @@ class OptionsChainService:
                 "calls": calls,
                 "preview_rows": preview_rows,
                 "request_diagnostics": request_diagnostics,
+                "cache_diagnostics": {"option_chain_cache": "miss", "option_chain_cache_ttl_seconds": self._summary_cache_ttl_seconds},
                 "message": "SPX option chain retrieved successfully.",
             }
             self._store_cached_summary(cache_key, summary)
+            metrics.record(
+                "Apollo option-chain refresh",
+                (perf_counter() - started) * 1000.0,
+                cache_hit=False,
+                detail=f"{resolved_caller_context}|{resolved_expiration.isoformat()}",
+            )
             return summary
         except Exception as exc:
             request_diagnostics = getattr(provider, "last_option_chain_diagnostics", {}) if provider is not None else {}
@@ -174,9 +200,16 @@ class OptionsChainService:
                 "calls": [],
                 "preview_rows": [],
                 "request_diagnostics": request_diagnostics,
+                "cache_diagnostics": {"option_chain_cache": "miss", "option_chain_cache_ttl_seconds": self._summary_cache_ttl_seconds},
                 "message": str(exc),
             }
             self._store_cached_summary(cache_key, summary)
+            metrics.record(
+                "Apollo option-chain refresh",
+                (perf_counter() - started) * 1000.0,
+                cache_hit=False,
+                detail=f"{resolved_caller_context}|{resolved_expiration.isoformat()}",
+            )
             return summary
 
     def _get_cached_summary(self, cache_key: tuple[str, str]) -> Dict[str, Any] | None:
@@ -187,7 +220,7 @@ class OptionsChainService:
         if not isinstance(cached_at, datetime):
             self._summary_cache.pop(cache_key, None)
             return None
-        if (self._now() - cached_at) > timedelta(seconds=self.SUMMARY_CACHE_TTL_SECONDS):
+        if (self._now() - cached_at) > timedelta(seconds=self._summary_cache_ttl_seconds):
             self._summary_cache.pop(cache_key, None)
             return None
         return dict(cached_entry.get("summary") or {})
@@ -214,7 +247,7 @@ class OptionsChainService:
         )
         now = self._now()
         prior_logged_at = self._normalization_log_cache.get(log_key)
-        if prior_logged_at is not None and (now - prior_logged_at) <= timedelta(seconds=self.SUMMARY_CACHE_TTL_SECONDS):
+        if prior_logged_at is not None and (now - prior_logged_at) <= timedelta(seconds=self._summary_cache_ttl_seconds):
             return
         self._normalization_log_cache[log_key] = now
         LOGGER.warning(
@@ -272,7 +305,11 @@ class OptionsChainService:
 
         if not failure_category:
             normalized_message = message.lower()
-            if any(code in normalized_message for code in ("503", "502", "504", "429")):
+            if "schwab token expired" in normalized_message or "authentication expired" in normalized_message:
+                failure_category = "token-expired"
+            elif "schwab authentication required" in normalized_message or "login to connect to schwab" in normalized_message:
+                failure_category = "auth-required"
+            elif any(code in normalized_message for code in ("503", "502", "504", "429")):
                 failure_category = "upstream-unavailable"
             elif any(code in normalized_message for code in ("400", "404", "422")):
                 failure_category = "malformed-request"
@@ -281,6 +318,8 @@ class OptionsChainService:
 
         if not failure_label:
             failure_label = {
+                "auth-required": "Schwab authentication required",
+                "token-expired": "Schwab token expired",
                 "upstream-unavailable": "Upstream unavailable",
                 "malformed-request": "Malformed request",
                 "exchange-closed": "Exchange closed",
@@ -290,6 +329,8 @@ class OptionsChainService:
         failure_status_class = "poor" if failure_category == "malformed-request" else "not-available"
         if failure_category == "exchange-closed":
             failure_status_class = "neutral"
+        if failure_category in {"auth-required", "token-expired"}:
+            failure_status_class = "warning"
         return failure_category, failure_label, failure_status_class
 
     def _resolve_provider(self) -> Any:

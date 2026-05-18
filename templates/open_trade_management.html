@@ -15,8 +15,8 @@
             {{ render_delphi_header(
                 active_page='management',
                 page_heading='Open Trade Management',
-                page_copy='Live management board for open Apollo and Talos positions with controlled Pushover escalation.',
-                page_meta='Live open-trade management for retained Apollo and Talos positions.',
+                page_copy='Live management board for open Talos positions with controlled Pushover escalation.' if hosted_mode else 'Live management board for open Apollo and Talos positions with controlled Pushover escalation.',
+                page_meta='Live open-trade management for retained Talos positions only in hosted mode.' if hosted_mode else 'Live open-trade management for retained Apollo and Talos positions.',
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
                 menu_status=menu_status,
@@ -35,18 +35,8 @@
             <div class="result-header">
                 <div>
                     <h2>Management Engine</h2>
-                    <p class="subtle">{% if hosted_mode %}Hosted Talos 2.1.2 pulls the same live open-trade evaluation data into a Supabase-backed board with the same send-to-close controls used on the local workflow. Global alert preferences now live in the header Notifications panel.{% else %}Real open trades are evaluated for morning snapshot, status change, action, and end-of-day Pushover notifications. Simulated open trades remain visible on this board for management review, and manual status updates stay limited to real and simulated positions. Global alert preferences now live in the header Notifications panel.{% endif %}</p>
+                    <p class="subtle">{% if hosted_mode %}Hosted Talos 3.10 pulls the same live Talos Fortress management data into the Shared Supabase Journal board with the same send-to-close controls used on the local workflow.{% else %}Live Apollo and Talos positions are evaluated on the same board. Talos positions now follow Fortress exit gates instead of notification-driven status updates.{% endif %}</p>
                 </div>
-                {% if management_actions_enabled %}
-                    <div class="actions trade-actions">
-                        <form method="post" action="{{ management_action_urls.get('real_status_update', url_for('open_trade_management_status_update', trade_mode='real')) }}">
-                            <button type="submit">Send Real Status Update</button>
-                        </form>
-                        <form method="post" action="{{ management_action_urls.get('simulated_status_update', url_for('open_trade_management_status_update', trade_mode='simulated')) }}">
-                            <button type="submit" class="secondary">Send Simulated Status Update</button>
-                        </form>
-                    </div>
-                {% endif %}
             </div>
 
             <div class="summary-grid trade-summary-grid">
@@ -57,10 +47,6 @@
                 <article class="summary-card">
                     <p class="summary-label">Evaluated At</p>
                     <p class="summary-value management-summary-value">{{ management_payload.evaluated_at_display }}</p>
-                </article>
-                <article class="summary-card" aria-label="Notifications: {{ 'ON' if management_payload.notifications_enabled else 'OFF' }}">
-                    <p class="summary-label">Notifications</p>
-                    <p class="summary-value">{{ 'ON' if management_payload.notifications_enabled else 'OFF' }}</p>
                 </article>
                 <article class="summary-card">
                     <p class="summary-label">Live EM</p>
@@ -86,7 +72,7 @@
                 <div>
                     <h2>Open Positions</h2>
                     {% if not suppress_open_positions_copy %}
-                        <p class="subtle">{% if hosted_mode %}Statuses and action recommendations use the current live option-chain expected move. Hosted Talos 2.1.2 alert delivery only applies to real trades, but both real and simulated open positions are listed here.{% else %}Statuses and action recommendations use the current live option-chain expected move. Talos 2.1.2 local alert delivery only applies to real trades, while real and simulated open positions are listed here.{% endif %}</p>
+                        <p class="subtle">{% if hosted_mode %}Statuses and action recommendations use the current live option-chain expected move and Talos Fortress exit gates. Only Talos positions are listed on this hosted board.{% else %}Statuses and action recommendations use the current live option-chain expected move. Talos rows now expose Fortress exit gates directly on the management board.{% endif %}</p>
                     {% endif %}
                 </div>
             </div>
@@ -126,9 +112,10 @@
                         </thead>
                         <tbody>
                             {% for item in management_payload.records %}
-                                <tr class="management-row management-row-{{ item.trade_mode|lower }}">
+                                {% set visual_mode = 'simulated' if item.trade_mode|lower == 'simulated' else 'real' %}
+                                <tr class="management-row management-row-{{ visual_mode }}">
                                     <td>{{ item.trade_number }}</td>
-                                    <td>{{ item.system_name }}</td>
+                                    <td>{% if item.system_name == 'Talos' %}<span class="talos-system-pill talos-system-pill-{{ visual_mode }}">TALOS {{ 'SIMULATED' if visual_mode == 'simulated' else 'REAL' }}</span>{% else %}{{ item.system_name }}{% endif %}</td>
                                     <td>{{ 'SubPrime' if hosted_mode and item.profile_label == 'Subprime' else item.profile_label }}</td>
                                     <td>{{ item.contracts_display }}</td>
                                     <td><strong>{{ item.total_premium_display }}</strong></td>

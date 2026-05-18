@@ -76,6 +76,9 @@ Supported values:
 - `SCHWAB_TOKEN_URL`
 - `SCHWAB_BASE_URL`
 - `SCHWAB_TOKEN_PATH`
+- `SCHWAB_SHARED_MARKET_TOKEN_PATH`
+
+Talos 3.2 should point both `SCHWAB_TOKEN_PATH` and `SCHWAB_SHARED_MARKET_TOKEN_PATH` at the same Talos-3.0 market-data token file, for example `instance/schwab_market_data_token.json`.
 
 Copy `.env.example` to `.env` and edit as needed, or set the variables directly in your shell.
 

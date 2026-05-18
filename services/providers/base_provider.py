@@ -97,6 +97,10 @@ class BaseMarketDataProvider(ABC):
         """Placeholder future option-chain contract for providers that support it."""
         raise ProviderNotImplementedError("Option-chain support has not been implemented for this provider yet.")
 
+    def get_account_summary(self) -> Dict[str, Any]:
+        """Return broker account summary details when the provider supports account access."""
+        raise ProviderNotImplementedError(f"{self.provider_name} does not provide account summary data for this workflow yet.")
+
 
 class UnavailableProvider(BaseMarketDataProvider):
     """Provider that raises a friendly error when configuration is unsupported."""

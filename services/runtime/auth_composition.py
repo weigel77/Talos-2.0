@@ -32,7 +32,7 @@ class LocalAuthComposer:
         self.token_path = token_path
 
     def create_token_repository(self) -> TokenRepository:
-        return JsonFileTokenRepository(self.token_path or self.config.schwab_token_path)
+        return JsonFileTokenRepository(self.token_path or self.config.schwab_shared_market_token_path)
 
     def create_schwab_auth_service(self) -> SchwabAuthService:
         return SchwabAuthService(config=self.config, token_store=self.create_token_repository())

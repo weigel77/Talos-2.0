@@ -15,7 +15,7 @@ def test_core_routes_smoke() -> None:
     app = create_app({"TESTING": True, "WTF_CSRF_ENABLED": False})
     client = app.test_client()
 
-    for route in ("/", "/apollo", "/journal", "/performance"):
+    for route in ("/", "/apollo", "/journal", "/performance", "/talos"):
         response = client.get(route, follow_redirects=True)
         assert response.status_code == 200
 
@@ -24,8 +24,21 @@ def test_removed_routes_stay_unavailable() -> None:
     app = create_app({"TESTING": True, "WTF_CSRF_ENABLED": False})
     client = app.test_client()
 
-    for route in ("/kairos", "/research"):
+    for route in (
+        "/kairos",
+        "/research",
+        "/notifications",
+        "/hosted/notifications",
+    ):
         response = client.get(route, follow_redirects=False)
+        assert response.status_code == 404
+
+    for route in (
+        "/api/text-status",
+        "/management/open-trades/status-update/real",
+        "/hosted/manage-trades/status-update/real",
+    ):
+        response = client.post(route, follow_redirects=False)
         assert response.status_code == 404
 
 
@@ -62,6 +75,27 @@ def test_journal_loader_keeps_only_retained_systems() -> None:
     rows = load_retained_trade_rows(store, "real")
 
     assert [row["trade_number"] for row in rows] == [1, 200]
+
+
+def test_talos_trade_view_only_keeps_talos_owned_rows() -> None:
+    store = StubTradeStore(
+        {
+            "real": [
+                {"trade_number": 1, "trade_mode": "real", "system_name": "Apollo"},
+                {"trade_number": 2, "trade_mode": "real", "system_name": "Talos"},
+            ],
+            "simulated": [
+                {"trade_number": 3, "trade_mode": "simulated", "system_name": "Talos"},
+            ],
+            "talos": [
+                {"trade_number": 4, "trade_mode": "talos", "system_name": "Apollo"},
+            ],
+        }
+    )
+
+    rows = load_retained_trade_rows(store, "talos")
+
+    assert [row["trade_number"] for row in rows] == [2, 3, 4]
 
 
 def test_performance_loader_excludes_kairos_and_other_records() -> None:

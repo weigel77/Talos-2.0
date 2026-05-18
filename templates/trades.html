@@ -18,7 +18,7 @@
                 active_page='journal',
                 page_heading=trade_mode_label,
                 page_copy=trade_mode_description,
-                page_meta='Persistent Talos 2 trade log for retained Apollo and Talos journal rows.',
+                page_meta='Shared Supabase Journal for retained Talos trade rows only in hosted mode.' if hosted_read_only else 'Shared Supabase Journal for retained Apollo and Talos trade rows.',
                 page_kicker=app_identity.page_kicker,
                 page_version=app_identity.version_label,
                 menu_status=menu_status,
@@ -48,7 +48,7 @@
             <div class="result-header">
                 <div>
                     <h2>{{ trade_mode_label }}</h2>
-                    <p class="subtle">{% if hosted_read_only %}{% if allow_trade_edit %}Hosted Talos 2.1.2 journal mirrors the live Supabase trade store and supports draft review, editing, and deleting directly in hosted mode.{% else %}Hosted Talos 2.1.2 journal mirrors the live trade store in read-only mode so links stay working and the browser surface stays safe.{% endif %}{% else %}One local database stores retained Apollo and Talos trades for the shared Talos workflow.{% endif %}</p>
+                    <p class="subtle">{% if hosted_read_only %}{% if allow_trade_edit %}Hosted Talos 3.10 journal mirrors only Talos rows from the live Shared Supabase Journal and supports draft review, editing, and deleting directly in hosted mode.{% else %}Hosted Talos 3.10 journal mirrors only Talos rows from the live Shared Supabase Journal in read-only mode so links stay working and the browser surface stays safe.{% endif %}{% else %}The Shared Supabase Journal stores retained Apollo and Talos trades in one shared trade store.{% endif %}</p>
                 </div>
             </div>
 
@@ -275,7 +275,7 @@
             <div class="result-header">
                 <div>
                     <h2>{{ form_title }}</h2>
-                    <p class="subtle">{% if hosted_read_only %}Hosted saves write directly to the Supabase journal tables. Trade status and result are derived automatically from exit data and close-event contract totals.{% else %}Manual entries land in the same SQLite journal as Apollo executions. Trade status and result are derived automatically from exit data and close-event contract totals.{% endif %}</p>
+                    <p class="subtle">{% if hosted_read_only %}Hosted saves write directly to the Shared Supabase Journal tables. Trade status and result are derived automatically from exit data and close-event contract totals.{% else %}Manual entries land in the same Shared Supabase Journal used by Apollo and Talos. Trade status and result are derived automatically from exit data and close-event contract totals.{% endif %}</p>
                 </div>
             </div>
 
