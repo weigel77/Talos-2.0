@@ -269,7 +269,7 @@ class SchwabAuthService:
                 return {
                     "connected": False,
                     "requires_login": False,
-                    "requires_refresh": False,
+                    "requires_refresh": True,
                     "status_label": "Refreshing Schwab token",
                     "status_meta": last_auth_error or "Schwab will refresh automatically on the next request.",
                     "auth_state": "refreshing",

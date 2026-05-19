@@ -334,11 +334,11 @@ def build_oauth_session_keys(namespace: str) -> Dict[str, str]:
     }
 
 
-def redact_execution_authorize_url(url: str) -> str:
+def redact_authorize_url(url: str) -> str:
     parsed = urllib.parse.urlparse(str(url or ""))
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     redacted_query = [
-        (key, "REDACTED" if key.lower() == "client_id" else value)
+        (key, "REDACTED" if key.lower() in {"client_id", "client_secret"} else value)
         for key, value in query
     ]
     return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(redacted_query, doseq=True)))
@@ -390,6 +390,7 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
         "FLASK_SECRET_KEY": "flask_secret_key",
         "SCHWAB_CLIENT_ID": "schwab_client_id",
         "SCHWAB_CLIENT_SECRET": "schwab_client_secret",
+        "SCHWAB_MARKET_REDIRECT_URI": "schwab_redirect_uri",
         "SCHWAB_REDIRECT_URI": "schwab_redirect_uri",
         "SCHWAB_AUTH_URL": "schwab_auth_url",
         "SCHWAB_TOKEN_URL": "schwab_token_url",
@@ -913,7 +914,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
                 "yes" if trading_client_id and trading_client_id == market_client_id else "no",
                 "yes" if bool(str(auth_service.config.schwab_trading_client_secret or "").strip()) else "no",
                 auth_service.config.schwab_trading_redirect_uri,
-                authorize_url,
+                redact_authorize_url(authorize_url),
             )
             return redirect(authorize_url)
         except Exception as exc:
@@ -2632,7 +2633,11 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
 
         try:
             authorize_url = auth_service.build_authorization_url(state=state)
-            app.logger.info("Schwab authorize URL | %s", authorize_url)
+            app.logger.info(
+                "Market-data OAuth authorize URL generated | redirect_uri=%s | authorize_url=%s",
+                runtime_app_config.schwab_redirect_uri,
+                redact_authorize_url(authorize_url),
+            )
             return redirect(authorize_url)
         except Exception as exc:
             workflow_state.put(oauth_session_keys["login_in_progress"], False)
@@ -7520,7 +7525,7 @@ def build_runtime_startup_messages(root_app: Flask, runtime_profile: RuntimeProf
         auth_service = getattr(provider, "auth_service", None)
         if auth_service is not None:
             authorize_url = auth_service.build_authorization_url(state="startup-preview")
-            messages.append(f"Schwab authorize URL: {authorize_url}")
+            messages.append(f"Schwab authorize URL: {redact_authorize_url(authorize_url)}")
     except Exception as exc:
         root_app.logger.warning("Unable to build Schwab authorize URL at startup: %s", exc)
     return messages

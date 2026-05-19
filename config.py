@@ -180,7 +180,7 @@ class AppConfig:
             flask_secret_key=os.getenv("FLASK_SECRET_KEY", "horme-dev-secret-key").strip() or "horme-dev-secret-key",
             schwab_client_id=os.getenv("SCHWAB_CLIENT_ID", "").strip(),
             schwab_client_secret=os.getenv("SCHWAB_CLIENT_SECRET", "").strip(),
-            schwab_redirect_uri=os.getenv("SCHWAB_REDIRECT_URI", "").strip(),
+            schwab_redirect_uri=(os.getenv("SCHWAB_REDIRECT_URI", "").strip() or os.getenv("SCHWAB_MARKET_REDIRECT_URI", "").strip()),
             schwab_auth_url=os.getenv("SCHWAB_AUTH_URL", "https://api.schwabapi.com/v1/oauth/authorize").strip()
             or "https://api.schwabapi.com/v1/oauth/authorize",
             schwab_token_url=os.getenv("SCHWAB_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token").strip()

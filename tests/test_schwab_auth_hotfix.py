@@ -11,9 +11,12 @@ from app import (
     LEGACY_EXECUTION_OAUTH_CALLBACK_ROUTE,
     MARKET_OAUTH_CALLBACK_ROUTE,
     build_runtime_startup_messages,
+    build_startup_menu_payload,
     create_app,
     get_runtime_profile,
     migrate_legacy_schwab_market_token,
+    redact_authorize_url,
+    resolve_runtime_app_config,
     resolve_schwab_connection_status,
     validate_persisted_schwab_token,
 )
@@ -85,8 +88,30 @@ def utcnow() -> datetime:
 
 
 class SchwabAuthHotfixTests(unittest.TestCase):
+    def test_redact_authorize_url_masks_sensitive_query_values(self) -> None:
+        redacted = redact_authorize_url(
+            "https://example.com/oauth?client_id=abc123&client_secret=secret123&redirect_uri=https%3A%2F%2Ftalos.eigeltrade.com%2Fcallback"
+        )
+
+        self.assertIn("client_id=REDACTED", redacted)
+        self.assertIn("client_secret=REDACTED", redacted)
+        self.assertIn("redirect_uri=https%3A%2F%2Ftalos.eigeltrade.com%2Fcallback", redacted)
+
     def test_production_trading_callback_uses_auth_schwab_callback(self) -> None:
         self.assertEqual(HOSTED_PRODUCTION_TRADING_CALLBACK_URL, "https://talos.eigeltrade.com/auth/schwab/callback")
+
+    def test_market_redirect_alias_env_is_accepted(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "SCHWAB_REDIRECT_URI": "",
+                "SCHWAB_MARKET_REDIRECT_URI": "https://talos.eigeltrade.com/callback",
+            },
+            clear=False,
+        ):
+            resolved_config = AppConfig.from_env()
+
+        self.assertEqual(resolved_config.schwab_redirect_uri, "https://talos.eigeltrade.com/callback")
 
     def test_app_exposes_market_and_execution_callback_routes(self) -> None:
         app = create_app({"TESTING": True, "RUNTIME_TARGET": "hosted", "HOSTED_PUBLIC_BASE_URL": "https://127.0.0.1:5015"})
@@ -105,6 +130,27 @@ class SchwabAuthHotfixTests(unittest.TestCase):
 
         self.assertIn(f"Registered market callback route: {MARKET_OAUTH_CALLBACK_ROUTE}", messages)
         self.assertIn(f"Registered execution callback route: {EXECUTION_OAUTH_CALLBACK_ROUTE}", messages)
+
+    def test_refreshing_market_auth_still_requires_header_reconnect_button(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            token_path = Path(temp_dir) / "schwab-token.json"
+            repository = JsonFileTokenRepository(token_path)
+            repository.save(
+                {
+                    "access_token": "expired-access",
+                    "refresh_token": "refresh-token",
+                    "expires_at": (utcnow() - timedelta(minutes=5)).isoformat(),
+                    "refresh_expires_at": (utcnow() + timedelta(days=5)).isoformat(),
+                    "auth_state": "connected",
+                    "last_auth_error": "Schwab refresh token was rejected. Please log in again.",
+                }
+            )
+            auth_service = SchwabAuthService(config=build_config(), token_store=repository)
+            market_service = StubMarketDataService(auth_service)
+
+            menu_status = build_startup_menu_payload(market_service)
+
+            self.assertTrue(menu_status["connection_requires_login"])
 
     def test_default_market_token_path_is_one_authoritative_instance_file(self) -> None:
         config = build_config()
@@ -200,7 +246,7 @@ class SchwabAuthHotfixTests(unittest.TestCase):
 
             self.assertEqual(status["status_label"], "Refreshing Schwab token")
             self.assertFalse(status["requires_login"])
-            self.assertFalse(status["requires_refresh"])
+            self.assertTrue(status["requires_refresh"])
 
     def test_stale_refresh_expired_state_does_not_block_valid_access_token(self) -> None:
         with TemporaryDirectory() as temp_dir:
