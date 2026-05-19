@@ -30,6 +30,7 @@ from config import (
     HOSTED_PRODUCTION_PUBLIC_BASE_URL,
     LOCAL_SCHWAB_TRADING_REDIRECT_URI,
     get_app_config,
+    is_render_production_environment,
 )
 from services import (
     ApolloService,
@@ -127,9 +128,15 @@ HOSTED_OPEN_TRADES_CACHE_SECONDS = 10
 HOSTED_APOLLO_SNAPSHOT_CACHE_SECONDS = 20
 
 
-def migrate_legacy_schwab_market_token(target_token_path: Path, *, workspace_root: Path) -> Path | None:
+def migrate_legacy_schwab_market_token(target_token_path: Path | str, *, workspace_root: Path) -> Path | None:
     """Promote any legacy Talos-3.0 local token file into the authoritative market-data token path."""
-    resolved_target = target_token_path.expanduser()
+    raw_target_path = str(target_token_path or "").strip()
+    looks_like_windows_drive = bool(re.match(r"^[A-Za-z]:[\\/]", raw_target_path))
+    looks_like_uri = (bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", raw_target_path)) and not looks_like_windows_drive) or "://" in raw_target_path
+    if not raw_target_path or looks_like_uri:
+        return None
+
+    resolved_target = Path(raw_target_path).expanduser()
     if resolved_target.exists():
         return None
 
@@ -417,10 +424,9 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
     strict_hosted_production = (
         runtime_target == "hosted"
         and not app.testing
-        and (
-            os.getenv("RENDER") == "true"
-            or bool(os.getenv("RENDER_SERVICE_ID"))
-            or str(os.getenv("DELPHI_DEPLOYMENT_ENV") or "").strip().lower() == "production"
+        and is_render_production_environment(
+            hosted_public_base_url=hosted_public_base_url,
+            deployment_env=str(app.config.get("DELPHI_DEPLOYMENT_ENV") or os.getenv("DELPHI_DEPLOYMENT_ENV") or ""),
         )
     )
 
@@ -429,12 +435,12 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
         if strict_hosted_production and not normalized_hosted_public_base_url:
             normalized_hosted_public_base_url = HOSTED_PRODUCTION_PUBLIC_BASE_URL
         if strict_hosted_production and normalized_hosted_public_base_url != HOSTED_PRODUCTION_PUBLIC_BASE_URL:
-            raise RuntimeError("Hosted production requires HOSTED_PUBLIC_BASE_URL=https://eigeltrade.com.")
+            raise RuntimeError("Hosted production requires HOSTED_PUBLIC_BASE_URL=https://talos.eigeltrade.com.")
 
         if strict_hosted_production:
             resolved_redirect_uri = HOSTED_PRODUCTION_CALLBACK_URL
             if configured_redirect_uri and configured_redirect_uri != HOSTED_PRODUCTION_CALLBACK_URL:
-                raise RuntimeError("Hosted production rejects non-eigeltrade SCHWAB_REDIRECT_URI values.")
+                raise RuntimeError("Hosted production rejects non-talos.eigeltrade.com SCHWAB_REDIRECT_URI values.")
         elif normalized_hosted_public_base_url:
             resolved_redirect_uri = f"{normalized_hosted_public_base_url}/callback"
         elif configured_redirect_uri:
@@ -456,7 +462,7 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
             config_payload["schwab_token_path"] = "supabase://hosted_runtime_state/schwab_oauth_token/default"
             config_payload["schwab_shared_market_token_path"] = "supabase://hosted_runtime_state/schwab_oauth_token/default"
         if strict_hosted_production and resolved_redirect_uri != HOSTED_PRODUCTION_CALLBACK_URL:
-            raise RuntimeError("Hosted production requires SCHWAB redirect_uri=https://eigeltrade.com/callback.")
+            raise RuntimeError("Hosted production requires SCHWAB redirect_uri=https://talos.eigeltrade.com/callback.")
     elif configured_redirect_uri:
         config_payload["schwab_redirect_uri"] = configured_redirect_uri
     else:
@@ -7489,6 +7495,15 @@ def ensure_runtime_ssl_context(runtime_profile: RuntimeProfile, *, app: Optional
 
 def build_runtime_startup_messages(root_app: Flask, runtime_profile: RuntimeProfile) -> list[str]:
     messages: list[str] = []
+    hosted_public_base_url = str(root_app.config.get("HOSTED_PUBLIC_BASE_URL") or "").strip()
+    render_production = is_render_production_environment(
+        hosted_public_base_url=hosted_public_base_url,
+        deployment_env=str(root_app.config.get("DELPHI_DEPLOYMENT_ENV") or ""),
+    )
+    if render_production:
+        messages.append(
+            f"Render production detected; skipping local SSL cert generation | port={runtime_profile.port} | public_base_url={hosted_public_base_url or 'unset'}"
+        )
     if runtime_profile.use_https:
         messages.append(f"Running HTTPS on {runtime_profile.launch_url}")
     else:
@@ -7542,7 +7557,11 @@ app = create_app()
 
 if __name__ == "__main__":
     runtime_profile = get_runtime_profile(app)
-    resolved_ssl_context = ensure_runtime_ssl_context(runtime_profile, app=app)
+    render_production = is_render_production_environment(
+        hosted_public_base_url=str(app.config.get("HOSTED_PUBLIC_BASE_URL") or ""),
+        deployment_env=str(app.config.get("DELPHI_DEPLOYMENT_ENV") or ""),
+    )
+    resolved_ssl_context = None if render_production else ensure_runtime_ssl_context(runtime_profile, app=app)
     for startup_message in build_runtime_startup_messages(app, runtime_profile):
         print(startup_message)
     get_runtime_lifecycle(app).schedule_launch()

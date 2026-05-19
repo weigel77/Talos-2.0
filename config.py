@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - optional dependency during bootstrap
 HOSTED_RUNTIME_HOST = "127.0.0.1"
 HOSTED_RUNTIME_PORT = 5015
 HOSTED_RUNTIME_BASE_URL = f"https://{HOSTED_RUNTIME_HOST}:{HOSTED_RUNTIME_PORT}"
-HOSTED_PRODUCTION_PUBLIC_BASE_URL = "https://eigeltrade.com"
+HOSTED_PRODUCTION_PUBLIC_BASE_URL = "https://talos.eigeltrade.com"
 HOSTED_PRODUCTION_CALLBACK_URL = f"{HOSTED_PRODUCTION_PUBLIC_BASE_URL}/callback"
 HOSTED_PRODUCTION_TRADING_CALLBACK_URL = "https://talos.eigeltrade.com/auth/schwab-trading/callback"
 LOCAL_SCHWAB_TRADING_REDIRECT_URI = f"{HOSTED_RUNTIME_BASE_URL}/auth/schwab-trading/callback"
@@ -28,6 +28,21 @@ HOSTED_SESSION_COOKIE_NAME = "delphi5_hosted_session"
 HOSTED_OAUTH_SESSION_NAMESPACE = "delphi5hosted"
 DEFAULT_SCHWAB_MARKET_TOKEN_PATH = str(Path("instance") / "schwab_market_data_token.json")
 DEFAULT_SCHWAB_TRADING_TOKEN_PATH = str(Path("instance") / "schwab_trading_token.json")
+
+
+def is_render_production_environment(
+    *,
+    hosted_public_base_url: str = "",
+    deployment_env: str = "",
+) -> bool:
+    normalized_base_url = str(hosted_public_base_url or "").strip().lower()
+    normalized_env = str(deployment_env or os.getenv("DELPHI_DEPLOYMENT_ENV") or "").strip().lower()
+    return (
+        str(os.getenv("RENDER") or "").strip().lower() == "true"
+        or bool(str(os.getenv("RENDER_SERVICE_ID") or "").strip())
+        or normalized_base_url.startswith(HOSTED_PRODUCTION_PUBLIC_BASE_URL)
+        or normalized_env == "production"
+    )
 
 
 def _default_schwab_token_path() -> str:

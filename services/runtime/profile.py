@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 from flask import Flask
 
-from config import AppConfig, HOSTED_RUNTIME_BASE_URL, HOSTED_RUNTIME_HOST, HOSTED_RUNTIME_PORT
+from config import AppConfig, HOSTED_RUNTIME_BASE_URL, HOSTED_RUNTIME_HOST, HOSTED_RUNTIME_PORT, is_render_production_environment
 
 
 @dataclass(frozen=True)
@@ -35,8 +36,15 @@ def select_runtime_profile(app: Flask, config: AppConfig) -> RuntimeProfile:
 
     if runtime_target == "hosted":
         bind_host = str(app.config.get("APP_HOST") or config.app_host or "0.0.0.0").strip() or "0.0.0.0"
-        bind_port = int(app.config.get("APP_PORT") or config.app_port or HOSTED_RUNTIME_PORT)
         launch_url = str(app.config.get("HOSTED_PUBLIC_BASE_URL") or config.hosted_public_base_url or "").strip()
+        render_production = is_render_production_environment(
+            hosted_public_base_url=launch_url,
+            deployment_env=str(app.config.get("DELPHI_DEPLOYMENT_ENV") or os.getenv("DELPHI_DEPLOYMENT_ENV") or ""),
+        )
+        if render_production:
+            bind_port = int(os.environ.get("PORT", HOSTED_RUNTIME_PORT))
+        else:
+            bind_port = int(app.config.get("APP_PORT") or config.app_port or HOSTED_RUNTIME_PORT)
         if not launch_url:
             if testing:
                 launch_url = HOSTED_RUNTIME_BASE_URL
@@ -45,7 +53,7 @@ def select_runtime_profile(app: Flask, config: AppConfig) -> RuntimeProfile:
         parsed = urlparse(launch_url)
         host = bind_host
         port = bind_port
-        use_https = parsed.scheme == "https"
+        use_https = parsed.scheme == "https" and not render_production
         ssl_context = None
         if use_https and (parsed.hostname or "").strip().lower() in {"127.0.0.1", "localhost"}:
             ssl_context = ("localhost+2.pem", "localhost+2-key.pem")
