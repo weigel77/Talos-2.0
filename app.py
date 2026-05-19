@@ -247,6 +247,9 @@ TRADE_MODE_DESCRIPTIONS = {
 }
 PUBLIC_TRADE_MODES = ("real", "simulated")
 LOCAL_SCHWAB_REDIRECT_URI = "https://127.0.0.1:5015/callback"
+MARKET_OAUTH_CALLBACK_ROUTE = "/callback"
+EXECUTION_OAUTH_CALLBACK_ROUTE = "/auth/schwab/callback"
+LEGACY_EXECUTION_OAUTH_CALLBACK_ROUTE = "/auth/schwab-trading/callback"
 TRADE_STATUS_OPTIONS = ["open", "closed", "expired", "cancelled"]
 TRADE_PROFILE_OPTIONS = ["Legacy", "Aggressive", "Fortress", "Standard", "Prime", "Subprime"]
 TRADE_OPTION_TYPE_OPTIONS = ["Put Credit Spread", "Call Credit Spread"]
@@ -453,7 +456,7 @@ def resolve_runtime_app_config(app: Flask, base_config: AppConfig) -> AppConfig:
         if strict_hosted_production:
             config_payload["schwab_trading_redirect_uri"] = HOSTED_PRODUCTION_TRADING_CALLBACK_URL
         elif normalized_hosted_public_base_url:
-            config_payload["schwab_trading_redirect_uri"] = f"{normalized_hosted_public_base_url}/auth/schwab-trading/callback"
+            config_payload["schwab_trading_redirect_uri"] = f"{normalized_hosted_public_base_url}{LEGACY_EXECUTION_OAUTH_CALLBACK_ROUTE}"
         elif configured_trading_redirect_uri:
             config_payload["schwab_trading_redirect_uri"] = configured_trading_redirect_uri
         else:
@@ -931,7 +934,8 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
             set_status_message(str(exc), level="error")
             return redirect(resolve_post_trading_oauth_redirect_target(app))
 
-    @app.get("/auth/schwab-trading/callback")
+    @app.get(EXECUTION_OAUTH_CALLBACK_ROUTE)
+    @app.get(LEGACY_EXECUTION_OAUTH_CALLBACK_ROUTE)
     def schwab_trading_callback() -> Any:
         workflow_state = get_workflow_state(app)
         session_keys = app.extensions["trading_oauth_session_keys"]
@@ -7504,6 +7508,8 @@ def build_runtime_startup_messages(root_app: Flask, runtime_profile: RuntimeProf
         messages.append(
             f"Render production detected; skipping local SSL cert generation | port={runtime_profile.port} | public_base_url={hosted_public_base_url or 'unset'}"
         )
+    messages.append(f"Registered market callback route: {MARKET_OAUTH_CALLBACK_ROUTE}")
+    messages.append(f"Registered execution callback route: {EXECUTION_OAUTH_CALLBACK_ROUTE}")
     if runtime_profile.use_https:
         messages.append(f"Running HTTPS on {runtime_profile.launch_url}")
     else:

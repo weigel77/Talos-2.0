@@ -6,8 +6,18 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from app import migrate_legacy_schwab_market_token, resolve_schwab_connection_status, validate_persisted_schwab_token
-from config import AppConfig, DEFAULT_SCHWAB_MARKET_TOKEN_PATH
+from app import (
+    EXECUTION_OAUTH_CALLBACK_ROUTE,
+    LEGACY_EXECUTION_OAUTH_CALLBACK_ROUTE,
+    MARKET_OAUTH_CALLBACK_ROUTE,
+    build_runtime_startup_messages,
+    create_app,
+    get_runtime_profile,
+    migrate_legacy_schwab_market_token,
+    resolve_schwab_connection_status,
+    validate_persisted_schwab_token,
+)
+from config import AppConfig, DEFAULT_SCHWAB_MARKET_TOKEN_PATH, HOSTED_PRODUCTION_TRADING_CALLBACK_URL
 from services.providers.base_provider import ProviderAuthRequiredError, ProviderReauthenticationRequiredError
 from services.providers.schwab_provider import SchwabProvider
 from services.repositories.token_repository import JsonFileTokenRepository
@@ -75,6 +85,27 @@ def utcnow() -> datetime:
 
 
 class SchwabAuthHotfixTests(unittest.TestCase):
+    def test_production_trading_callback_uses_auth_schwab_callback(self) -> None:
+        self.assertEqual(HOSTED_PRODUCTION_TRADING_CALLBACK_URL, "https://talos.eigeltrade.com/auth/schwab/callback")
+
+    def test_app_exposes_market_and_execution_callback_routes(self) -> None:
+        app = create_app({"TESTING": True, "RUNTIME_TARGET": "hosted", "HOSTED_PUBLIC_BASE_URL": "https://127.0.0.1:5015"})
+
+        routes = {rule.rule for rule in app.url_map.iter_rules()}
+
+        self.assertIn(MARKET_OAUTH_CALLBACK_ROUTE, routes)
+        self.assertIn(EXECUTION_OAUTH_CALLBACK_ROUTE, routes)
+        self.assertIn(LEGACY_EXECUTION_OAUTH_CALLBACK_ROUTE, routes)
+
+    def test_startup_messages_log_registered_callback_routes(self) -> None:
+        app = create_app({"TESTING": True, "RUNTIME_TARGET": "hosted", "HOSTED_PUBLIC_BASE_URL": "https://127.0.0.1:5015"})
+        profile = get_runtime_profile(app)
+
+        messages = build_runtime_startup_messages(app, profile)
+
+        self.assertIn(f"Registered market callback route: {MARKET_OAUTH_CALLBACK_ROUTE}", messages)
+        self.assertIn(f"Registered execution callback route: {EXECUTION_OAUTH_CALLBACK_ROUTE}", messages)
+
     def test_default_market_token_path_is_one_authoritative_instance_file(self) -> None:
         config = build_config()
 
